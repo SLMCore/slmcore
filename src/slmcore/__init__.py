@@ -18,9 +18,14 @@ from .engine.registry import (
 
 _load_default_registrations()
 
-from .application import (
-    SLMDefinition,SLMLayoutPolicy,SLMRuntimeFactory,StartupRuntime,
+from .application import SLMRuntimeFactory,StartupRuntime
+from .setup import (
+    SLMCorrectionSetup,
+    SLMHardwareSetup,
+    SLMSectionsSetup,
+    SLMSetup,
 )
+from .workspace import SLMPreferenceStore,SLMWorkspace,SLMWorkspaceLayout
 from .engine.section import (
     SectionContext,
     SectionGeometry,
@@ -80,8 +85,13 @@ __all__ = [
     "SectionUpdate",
     "SLM_CONFIG_SCHEMA_VERSION",
     "SLMCompiledFrame",
-    "SLMDefinition",
-    "SLMLayoutPolicy",
+    "SLMCorrectionSetup",
+    "SLMHardwareSetup",
+    "SLMSectionsSetup",
+    "SLMSetup",
+    "SLMPreferenceStore",
+    "SLMWorkspace",
+    "SLMWorkspaceLayout",
     "SLMRuntimeFactory",
     "StartupRuntime",
     "SLMConfigRepository",

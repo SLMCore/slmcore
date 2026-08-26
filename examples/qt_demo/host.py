@@ -6,8 +6,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from slmcore import SLMDefinition
-from slmcore.calibration import SLMCalibrationStore
+from slmcore import SLMSetup,SLMWorkspace
 from slmcore.host import MockSLMDeviceProvider,SLMHostServices
 from slmcore.qt import (
     PreviewContainer,
@@ -18,8 +17,7 @@ from slmcore.qt import (
     SLMQtSessionGroup,
 )
 
-from .preferences import DemoPreferences
-from .setup import DISPLAY_NAMES,create_demo_definitions
+from .setup import DISPLAY_NAMES,create_demo_setups
 from .window import DemoMainWindow
 
 
@@ -32,14 +30,8 @@ class DemoHost:
     def __init__(self,window: DemoMainWindow,*,data_dir: str | Path) -> None:
         self.window = window
         self.data_dir = Path(data_dir).expanduser().resolve()
-        self.data_dir.mkdir(parents=True,exist_ok=True)
-        self.preferences = DemoPreferences(self.data_dir)
-        self.calibration_store = SLMCalibrationStore(
-            self.data_dir / "calibrations",
-        )
-        self.factory = SLMQtSessionFactory(
-            calibration_store=self.calibration_store,
-        )
+        self.workspace = SLMWorkspace(self.data_dir)
+        self.factory = SLMQtSessionFactory(workspace=self.workspace)
         self.group = SLMQtSessionGroup(parent=window)
         self.sessions: dict[str,SLMQtSession] = {}
         self.devices: dict[str,MockSLMDeviceProvider] = {}
@@ -53,8 +45,8 @@ class DemoHost:
 
     def initialize(self) -> None:
         """Construct, mount and initialize every demo SLM."""
-        for definition in create_demo_definitions():
-            self._initialize_slm(definition)
+        for setup in create_demo_setups():
+            self._initialize_slm(setup)
         self.window.set_control_mode(self.group.control_mode)
         self.window.set_control_mode_change_enabled(
             self.group.can_change_control_mode,
@@ -78,17 +70,15 @@ class DemoHost:
         self.sessions.clear()
         self.devices.clear()
 
-    def _initialize_slm(self,definition: SLMDefinition) -> None:
-        slm_key = definition.identity.key
+    def _initialize_slm(self,setup: SLMSetup) -> None:
+        slm_key = setup.identity.key
         if slm_key in self.sessions:
             raise KeyError("SLM %r is already initialized" % slm_key)
 
         device = MockSLMDeviceProvider(requires_explicit_connection=True)
-        services = self._host_services(slm_key,device)
         session,panel = self.factory.create(
-            definition=definition,
-            config_directory=self.data_dir / "configs" / slm_key,
-            host_services=services,
+            setup=setup,
+            host_services=SLMHostServices(device=device),
             display_name=DISPLAY_NAMES.get(slm_key,slm_key),
             auto_upload_frame=True,
             layout_policy=SLMPanelLayoutPolicy(
@@ -127,37 +117,6 @@ class DemoHost:
             logger.warning("Mock device initialization failed for %s",slm_key)
         else:
             logger.info("Initialized %s with mock device",slm_key)
-
-    def _host_services(
-        self,slm_key: str,device: MockSLMDeviceProvider,
-    ) -> SLMHostServices:
-        return SLMHostServices.from_callbacks(
-            device=device,
-            measurement_provider=None,
-            get_startup_config=(
-                lambda key=slm_key:self.preferences.get_startup_config(key)
-            ),
-            set_startup_config=(
-                lambda value,key=slm_key:
-                self.preferences.set_startup_config(key,value)
-            ),
-            get_default_plane=(
-                lambda section,key=slm_key:
-                self.preferences.get_default_plane(key,section)
-            ),
-            set_default_plane=(
-                lambda section,value,key=slm_key:
-                self.preferences.set_default_plane(key,section,value)
-            ),
-            get_section_display_mode=(
-                lambda key=slm_key:
-                self.preferences.get_section_display_mode(key)
-            ),
-            set_section_display_mode=(
-                lambda value,key=slm_key:
-                self.preferences.set_section_display_mode(key,value)
-            ),
-        )
 
     @staticmethod
     def _install_session_logging(

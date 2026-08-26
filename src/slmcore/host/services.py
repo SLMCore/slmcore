@@ -110,6 +110,41 @@ class SLMHostServices:
                         "measurement_provider must implement %s()" % name
                     )
 
+
+    def with_fallbacks(self,fallbacks: "SLMHostServices | None") -> "SLMHostServices":
+        """Fill missing capabilities from fallback services.
+
+        Explicit host capabilities always win. This lets a workspace provide
+        reusable persistence defaults without overriding an embedding host.
+        """
+        if fallbacks is None:
+            return self
+        if not isinstance(fallbacks,SLMHostServices):
+            raise TypeError("fallbacks must be an SLMHostServices or None")
+        return type(self)(
+            device=self.device if self.device is not None else fallbacks.device,
+            measurement_provider=(
+                self.measurement_provider
+                if self.measurement_provider is not None
+                else fallbacks.measurement_provider
+            ),
+            calibration_preferences=(
+                self.calibration_preferences
+                if self.calibration_preferences is not None
+                else fallbacks.calibration_preferences
+            ),
+            configuration_preferences=(
+                self.configuration_preferences
+                if self.configuration_preferences is not None
+                else fallbacks.configuration_preferences
+            ),
+            section_view_preferences=(
+                self.section_view_preferences
+                if self.section_view_preferences is not None
+                else fallbacks.section_view_preferences
+            ),
+        )
+
     @property
     def can_upload_frame(self) -> bool:
         return self.device is not None

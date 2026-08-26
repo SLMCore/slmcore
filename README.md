@@ -48,10 +48,39 @@ and `cgh/computations/`.
 
 ## Integration layers
 
+- `setup/`: canonical installed-SLM setup model (identity, geometry, sections, corrections, and optional hardware description).
+- `workspace/`: reusable config/calibration/correction/preference persistence rooted at one application data directory.
 - `config/`: configuration models, serialization, migration, and repositories.
-- `application/`: host-supplied SLM definitions and runtime construction.
-- `host/`: host service contracts and callbacks.
+- `application/`: runtime construction from a canonical `SLMSetup`.
+- `host/`: optional host capability contracts and callbacks.
 - `qt/`: reusable Qt panels, sessions, views, and interaction controllers.
 
 The root `slmcore` package remains the convenient public facade for commonly
 used types. Internal architectural modules use the `slmcore.engine.*` paths.
+
+## Canonical setup and workspace
+
+`SLMSetup` is the public setup contract. It stores the physical identity and
+geometry plus the declared section layout and optional installed correction /
+hardware information. Section geometries are derived by slmcore rather than by
+the embedding host. `SLMIdentity.serial_number` is mandatory and is the stable
+physical namespace for persistent workspace data; `key` remains the logical
+runtime identifier.
+
+`SLMWorkspace(root)` provides the standard persistence implementation for a
+standalone or embedded application. Configs are stored per serial number, while
+calibration definitions and preferences are shared by the workspace. Correction
+resources preserve the established resolution behavior: an existing configured
+preferred directory wins, otherwise an existing workspace correction directory
+for the serial number is used; missing correction directories are not created
+automatically.
+
+The normal Qt composition is therefore:
+
+```python
+workspace = SLMWorkspace(data_dir)
+factory = SLMQtSessionFactory(workspace=workspace)
+session, panel = factory.create(setup=setup, host_services=services)
+```
+
+Explicit host preference capabilities still override the workspace defaults.

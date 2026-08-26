@@ -22,7 +22,7 @@ def _parse_args(argv: list[str] | None=None) -> argparse.Namespace:
         "--data-dir",
         type=Path,
         default=Path.home() / ".slmcore-demo",
-        help="Directory used for configs, calibrations and host preferences.",
+        help="slmcore workspace directory used for configs, calibrations and preferences.",
     )
     parser.add_argument(
         "--debug",

@@ -1,12 +1,12 @@
-"""Canonical SLM definitions used by the standalone Qt demo."""
+"""Canonical SLM setups used by the standalone Qt demo."""
 
 from slmcore import (
     SLMGeometry,
     SLMIdentity,
+    SLMSectionsSetup,
+    SLMSetup,
     SectionSplitLayout,
-    create_split_section_geometries,
 )
-from slmcore.application import SLMDefinition,SLMLayoutPolicy
 
 
 DISPLAY_NAMES = {
@@ -15,10 +15,10 @@ DISPLAY_NAMES = {
 }
 
 
-def create_demo_definitions() -> tuple[SLMDefinition,...]:
-    """Return two hardware-free definitions that exercise common layouts."""
+def create_demo_setups() -> tuple[SLMSetup,...]:
+    """Return two hardware-free setups that exercise common layouts."""
     return (
-        _definition(
+        _setup(
             key="demo_slm_1",
             serial_number="DEMO-001",
             width=512,
@@ -27,7 +27,7 @@ def create_demo_definitions() -> tuple[SLMDefinition,...]:
             layout=SectionSplitLayout(n_sections=1,axis="x"),
             customizable=False,
         ),
-        _definition(
+        _setup(
             key="demo_slm_2",
             serial_number="DEMO-002",
             width=512,
@@ -39,7 +39,7 @@ def create_demo_definitions() -> tuple[SLMDefinition,...]:
     )
 
 
-def _definition(
+def _setup(
     *,
     key: str,
     serial_number: str,
@@ -48,20 +48,16 @@ def _definition(
     pixel_size_um: float,
     layout: SectionSplitLayout,
     customizable: bool,
-) -> SLMDefinition:
-    geometry = SLMGeometry(
-        width=width,
-        height=height,
-        pixel_size_um=pixel_size_um,
-    )
-    return SLMDefinition(
+) -> SLMSetup:
+    return SLMSetup(
         identity=SLMIdentity(key,serial_number),
-        geometry=geometry,
-        layout_policy=SLMLayoutPolicy(
+        geometry=SLMGeometry(
+            width=width,
+            height=height,
+            pixel_size_um=pixel_size_um,
+        ),
+        sections=SLMSectionsSetup(
+            layout=layout,
             customizable=customizable,
-            setup_layout=layout,
-            setup_section_geometries=create_split_section_geometries(
-                geometry,layout,
-            ),
         ),
     )

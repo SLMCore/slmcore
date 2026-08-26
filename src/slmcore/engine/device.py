@@ -9,11 +9,17 @@ from typing import Mapping,Any
 @dataclass(frozen=True)
 class SLMIdentity:
     key: str
-    serial_number: str | None = None
+    serial_number: str
 
     def __post_init__(self) -> None:
-        if not self.key:
+        key = str(self.key or "").strip()
+        serial = str(self.serial_number or "").strip()
+        if not key:
             raise ValueError("SLM key cannot be empty")
+        if not serial:
+            raise ValueError("SLM serial_number cannot be empty")
+        object.__setattr__(self,"key",key)
+        object.__setattr__(self,"serial_number",serial)
 
     def to_dict(self):
         return {
@@ -24,8 +30,8 @@ class SLMIdentity:
     @classmethod
     def from_dict(cls,data: Mapping[str,Any]) -> SLMIdentity:
         return cls(
-            key=str(data["key"]),
-            serial_number=data.get("serial_number"),
+            key=data["key"],
+            serial_number=data["serial_number"],
         )
 
 

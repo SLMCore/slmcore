@@ -5,7 +5,7 @@ from typing import Mapping
 
 from qtpy import QtCore
 
-from ...application.definition import SLMLayoutPolicy
+from ...setup import SLMSetup
 from ...application.runtime_factory import SLMRuntimeFactory
 from ...calibration.geometry import calibration_geometry_mismatches
 from ...engine.section.geometry import (
@@ -29,7 +29,7 @@ class SectionSettingsManager(QtCore.QObject):
         controller,
         *,
         section_host,
-        layout_policy: SLMLayoutPolicy | None,
+        setup: SLMSetup | None,
         runtime_factory: SLMRuntimeFactory | None,
         view_preferences=None,
         parent=None,
@@ -37,7 +37,7 @@ class SectionSettingsManager(QtCore.QObject):
         super().__init__(parent)
         self.controller = controller
         self.section_host = section_host
-        self.layout_policy = layout_policy
+        self.setup = setup
         self.runtime_factory = runtime_factory
         self.view_preferences = view_preferences
         self._disposed = False
@@ -71,7 +71,7 @@ class SectionSettingsManager(QtCore.QObject):
             section_snapshots=collection.get_section_snapshots(),
             section_titles=self.section_host.section_titles(),
             section_layout_customizable=bool(
-                self.layout_policy is not None and self.layout_policy.customizable
+                self.setup is not None and self.setup.sections.customizable
             ),
             display_mode=self.section_host.display_mode,
             interaction_settings=self.controller.interaction_settings,
@@ -176,22 +176,22 @@ class SectionSettingsManager(QtCore.QObject):
     ) -> None:
         if not self.controller.editor_writes_allowed:
             return
-        policy = self.layout_policy
+        setup = self.setup
         factory = self.runtime_factory
         runtime = self.controller.runtime
         try:
-            if policy is None or factory is None:
+            if setup is None or factory is None:
                 raise RuntimeError("Section layout editing is not configured")
-            if not policy.customizable:
+            if not setup.sections.customizable:
                 raise ValueError("This setup does not allow section layout editing.")
             if not isinstance(layout,SectionSplitLayout):
                 raise TypeError("layout must be a SectionSplitLayout")
-            if layout.n_sections != policy.section_count:
+            if layout.n_sections != setup.section_count:
                 raise ValueError("Changing section count is not supported")
             section_geometries = create_split_section_geometries(
                 runtime.geometry,layout,
             )
-            policy.validate(runtime.geometry,runtime.geometry,section_geometries)
+            setup.validate_layout(runtime.geometry,section_geometries)
             current_signature = split_layout_signature(
                 runtime.geometry,
                 {key:runtime.get_section_geometry(key) for key in runtime.section_keys},

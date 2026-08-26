@@ -3,9 +3,9 @@ import pytest
 
 from slmcore import (
     DEFAULT_REGISTRIES,SLM_CONFIG_SCHEMA_VERSION,SLMConfig,SLMGeometry,SLMIdentity,
+    SLMSectionsSetup,SLMSetup,SLMWorkspace,
 )
-from slmcore.application import SLMDefinition,SLMLayoutPolicy
-from slmcore.engine.section import SectionSplitLayout,create_split_section_geometries
+from slmcore.engine.section import SectionSplitLayout
 from slmcore.host import MockSLMDeviceProvider,SLMHostServices
 
 
@@ -22,18 +22,13 @@ def _app():
     return app
 
 
-def _definition(key="slm",serial="SER123"):
-    geometry = SLMGeometry(width=24,height=12,pixel_size_um=1.0)
-    layout = SectionSplitLayout(n_sections=2,axis="x")
-    return SLMDefinition(
+def _setup(key="slm",serial="SER123"):
+    return SLMSetup(
         identity=SLMIdentity(key,serial),
-        geometry=geometry,
-        layout_policy=SLMLayoutPolicy(
+        geometry=SLMGeometry(width=24,height=12,pixel_size_um=1.0),
+        sections=SLMSectionsSetup(
+            layout=SectionSplitLayout(n_sections=2,axis="x"),
             customizable=True,
-            setup_layout=layout,
-            setup_section_geometries=create_split_section_geometries(
-                geometry,layout,
-            ),
         ),
     )
 
@@ -43,9 +38,10 @@ def _create_session(tmp_path,key="slm",serial="SER123"):
     from slmcore.qt import SLMQtSessionFactory
 
     device = MockSLMDeviceProvider()
-    session,panel = SLMQtSessionFactory().create(
-        definition=_definition(key,serial),
-        config_directory=tmp_path,
+    session,panel = SLMQtSessionFactory(
+        workspace=SLMWorkspace(tmp_path),
+    ).create(
+        setup=_setup(key,serial),
         host_services=SLMHostServices(device=device),
     )
     return session,panel,device

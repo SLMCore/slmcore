@@ -82,7 +82,7 @@ class SLMCalibrationStore:
         self,identity: Any,section_key: str,plane_name: str,
     ) -> SLMSectionCalibration:
         definition = self.plane_definition(plane_name)
-        serial = getattr(identity,"serial_number",None) or getattr(identity,"key",None)
+        serial = identity.serial_number
         calibration = load_section_calibration(
             str(self.directory),serial,section_key,plane_name,
         ).copy()
@@ -108,7 +108,7 @@ class SLMCalibrationStore:
             raise ValueError(
                 "Valid section calibrations must record section_geometry"
             )
-        serial = getattr(identity,"serial_number",None) or getattr(identity,"key",None)
+        serial = identity.serial_number
         save_section_calibration(
             str(self.directory),
             str(display_name or getattr(identity,"key",serial)),

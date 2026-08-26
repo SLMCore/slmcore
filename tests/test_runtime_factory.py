@@ -1,7 +1,9 @@
 import pytest
 
-from slmcore import DEFAULT_REGISTRIES,SLMGeometry,SLMIdentity
-from slmcore.application import SLMDefinition,SLMLayoutPolicy,SLMRuntimeFactory
+from slmcore import (
+    DEFAULT_REGISTRIES,SLMGeometry,SLMIdentity,SLMSectionsSetup,SLMSetup,
+)
+from slmcore.application import SLMRuntimeFactory
 from slmcore.calibration import SLMSectionCalibration,attach_calibration_geometry
 from slmcore.config import SLMConfigRepository
 from slmcore.engine.section import SectionSplitLayout,create_split_section_geometries
@@ -10,14 +12,12 @@ from slmcore.engine.section import SectionSplitLayout,create_split_section_geome
 def _factory(tmp_path=None):
     geometry = SLMGeometry(width=64,height=32,pixel_size_um=1.0)
     setup_layout = SectionSplitLayout(n_sections=2,axis="x")
-    setup_sections = create_split_section_geometries(geometry,setup_layout)
-    definition = SLMDefinition(
+    setup = SLMSetup(
         identity=SLMIdentity("slm","SER123"),
         geometry=geometry,
-        layout_policy=SLMLayoutPolicy(
+        sections=SLMSectionsSetup(
+            layout=setup_layout,
             customizable=True,
-            setup_layout=setup_layout,
-            setup_section_geometries=setup_sections,
         ),
     )
     repository = (
@@ -25,7 +25,7 @@ def _factory(tmp_path=None):
         else SLMConfigRepository(tmp_path,DEFAULT_REGISTRIES)
     )
     return SLMRuntimeFactory(
-        definition=definition,
+        setup=setup,
         registries=DEFAULT_REGISTRIES,
         config_repository=repository,
     ),repository

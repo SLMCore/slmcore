@@ -8,7 +8,7 @@ from ..config import SLMConfig
 from ..corrections import SLMCorrectionStore
 from ..engine.registry import DEFAULT_REGISTRIES,SLMRegistries
 from ..engine.runtime import SLMRuntime
-from .definition import SLMDefinition
+from ..setup import SLMSetup
 
 
 @dataclass(frozen=True)
@@ -19,42 +19,41 @@ class StartupRuntime:
 
 
 class SLMRuntimeFactory:
-    """Construct and validate runtimes for one physical SLM definition."""
+    """Construct and validate runtimes for one canonical SLM setup."""
 
     def __init__(
         self,
         *,
-        definition: SLMDefinition,
+        setup: SLMSetup,
         registries: SLMRegistries | None=None,
         correction_store: SLMCorrectionStore | None=None,
         config_repository=None,
     ) -> None:
-        if not isinstance(definition,SLMDefinition):
-            raise TypeError("definition must be an SLMDefinition")
+        if not isinstance(setup,SLMSetup):
+            raise TypeError("setup must be an SLMSetup")
         
         registries = DEFAULT_REGISTRIES if registries is None else registries
         if not isinstance(registries,SLMRegistries):
             raise TypeError("registries must be SLMRegistries or None")
 
-        self.definition = definition
+        self.setup = setup
         self.registries = registries
         self.correction_store = correction_store
         self.config_repository = config_repository
 
     def create_default(self) -> SLMRuntime:
         return SLMRuntime(
-            identity=self.definition.identity,
-            geometry=self.definition.geometry,
-            section_geometries=self.definition.layout_policy.setup_section_geometries,
+            identity=self.setup.identity,
+            geometry=self.setup.geometry,
+            section_geometries=self.setup.section_geometries,
             registries=self.registries,
             correction_store=self.correction_store,
         )
 
     def validate_config(self,config: SLMConfig):
-        if config.identity != self.definition.identity:
+        if config.identity != self.setup.identity:
             raise ValueError("SLM config identity does not match the physical SLM")
-        return self.definition.layout_policy.validate(
-            self.definition.geometry,
+        return self.setup.validate_layout(
             config.geometry,
             {key:section.geometry for key,section in config.sections.items()},
         )
@@ -92,8 +91,8 @@ class SLMRuntimeFactory:
         from ..config import SLM_CONFIG_SCHEMA_VERSION,SLMConfig
         import numpy as np
 
-        self.definition.layout_policy.validate(
-            runtime.geometry,runtime.geometry,section_geometries,
+        self.setup.validate_layout(
+            runtime.geometry,section_geometries,
         )
         clear = set(clear_calibration_sections or ())
         current_config = runtime.create_config()

@@ -153,9 +153,9 @@ class SLMQtSession(QtCore.QObject):
         self._section_settings = SectionSettingsManager(
             self,
             section_host=self.section_host,
-            layout_policy=(
+            setup=(
                 None if runtime_factory is None
-                else runtime_factory.definition.layout_policy
+                else runtime_factory.setup
             ),
             runtime_factory=runtime_factory,
             view_preferences=self.host_services.section_view_preferences,

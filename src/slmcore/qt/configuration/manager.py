@@ -117,8 +117,7 @@ class ConfigurationManager(QtCore.QObject):
             self.runtime_factory.validate_config(config)
             runtime = self.controller.runtime
             current_signature = self.controller.runtime_layout_signature()
-            config_signature = self.runtime_factory.definition.layout_policy.validate(
-                runtime.geometry,
+            config_signature = self.runtime_factory.setup.validate_layout(
                 config.geometry,
                 {key:section.geometry for key,section in config.sections.items()},
             )

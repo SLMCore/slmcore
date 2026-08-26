@@ -55,20 +55,22 @@ rather than routing dependencies back through public package facades.
 
 A host normally:
 
-1. translates physical setup information into `SLMDefinition` and
-   `SLMLayoutPolicy`;
-2. chooses the config directory and creates any setup-specific correction store;
-3. supplies physical capabilities and setup preferences through
-   `SLMHostServices` (typically `SLMHostServices.from_callbacks(...)`);
-4. constructs one `SLMQtSessionFactory(calibration_store=...)` (optionally with custom registries);
-5. calls `qt_session, panel = factory.create(definition=..., config_directory=..., correction_store=..., host_services=...)`;
+1. translates its setup representation into the canonical `SLMSetup`;
+2. creates one shared `SLMWorkspace` rooted at its SLM data directory;
+3. supplies physical capabilities and any host-specific preference overrides
+   through `SLMHostServices`;
+4. constructs one `SLMQtSessionFactory(workspace=...)` (optionally with custom registries);
+5. calls `qt_session, panel = factory.create(setup=..., host_services=...)`;
 6. mounts/registers the returned objects in the host;
 7. only then calls `qt_session.initialize_device()` when the configured output
    device should be initialized/published at startup.
 
-`SLMQtSessionFactory` owns default registry selection, `SLMConfigRepository` and `SLMRuntimeFactory` construction, and the generic startup/runtime/panel/session assembly.
-It does not initialize hardware. This allows an embedding host to complete its
-own registration/mount transaction before physical device side effects begin.
+`SLMQtSessionFactory` owns default registry selection, workspace-backed config /
+correction / calibration / preference resolution, `SLMRuntimeFactory`
+construction, and the generic startup/runtime/panel/session assembly. Explicit
+host preference capabilities override workspace defaults. The factory does not
+initialize hardware, allowing an embedding host to complete its own
+registration/mount transaction before physical device side effects begin.
 
 `SLMPanel` owns the standard composition currently used by ImSwitch. Its
 presentation-only `SLMPanelLayoutPolicy` controls integrated preview placement:
@@ -288,10 +290,10 @@ feedback/session state.
 
 ## Configuration, layout and runtime replacement
 
-`SLMLayoutPolicy` separates setup-level physical constraints from config-level
-current layout. The setup defines physical geometry, the default split, whether
-layout editing is allowed, and a fixed section count. A customized current
-split belongs to the SLM config and is not written back into host setup data.
+`SLMSetup.sections` defines setup-level physical layout constraints: the default
+split, whether layout editing is allowed, and a fixed section count. slmcore
+derives the setup section geometries from that declaration. A customized current
+split belongs to the SLM config and is not written back into setup data.
 
 `SLMConfigRepository` is the non-Qt directory-bound persistence facade.
 `ConfigurationManager` coordinates `ConfigControls` and dialogs with the
@@ -307,11 +309,13 @@ loads may explicitly accept or clear calibration geometry mismatches.
 
 ## Current host boundary
 
-The host now owns translation from host setup objects into `SLMDefinition`,
-filesystem root selection, tiny setup-preference adapters, SetupMode
+The host owns only translation from its setup objects into `SLMSetup`, workspace
+root selection, host-specific capability/preference overrides, SetupMode
 integration, the outer multi-SLM shell, and the concrete callbacks/driver behind
-`SLMDeviceProvider`. The reusable one-SLM UI composition, preview, connection
-control, config controls and section presentation live in `SLMPanel`.
+`SLMDeviceProvider`. Standard config/calibration/correction/preferences
+persistence is supplied by `SLMWorkspace`. The reusable one-SLM UI composition,
+preview, connection control, config controls and section presentation live in
+`SLMPanel`.
 
 Cross-SLM policies remain host-level. For example, ImSwitch deliberately
 propagates `RuntimeViewInteractionSettings` changes from one SLM session to

@@ -1,17 +1,16 @@
 from __future__ import annotations
 
-
+from pathlib import Path
 
 from qtpy import QtWidgets
 
-from ...application.definition import SLMDefinition
 from ...application.runtime_factory import SLMRuntimeFactory
-from ...calibration.store import SLMCalibrationStore
 from ...cgh.execution.executor import CGHExecutor
-from ...config.repository import SLMConfigRepository
 from ...corrections import SLMCorrectionStore
 from ...host.services import SLMHostServices
 from ...engine.registry import DEFAULT_REGISTRIES,SLMRegistries
+from ...setup import SLMSetup
+from ...workspace import SLMWorkspace
 from ..panel.panel import SLMPanel
 from ..panel.policy import (
     DEFAULT_SLM_PANEL_LAYOUT_POLICY,
@@ -29,36 +28,32 @@ from .session import SLMQtSession
 class SLMQtSessionFactory:
     """Construct the standard reusable Qt session and panel for one SLM.
 
-    The factory owns the generic runtime/startup/panel/session assembly. Hosts
-    provide the physical SLM definition, optional stores, and host capabilities.
-    It does not initialize or connect the physical device; hosts should do that
-    only after successfully mounting/registering the returned objects.
+    The factory owns generic setup resolution, runtime/startup construction,
+    persistence wiring, panel construction and session assembly. A workspace
+    supplies standard slmcore persistence; explicit host capabilities override
+    the workspace defaults. Physical device initialization remains a host-side
+    lifecycle decision after the returned session/panel are mounted.
     """
 
     def __init__(
         self,
         *,
         registries: SLMRegistries | None=None,
-        calibration_store: SLMCalibrationStore | None=None,
+        workspace: SLMWorkspace | None=None,
     ) -> None:
         registries = DEFAULT_REGISTRIES if registries is None else registries
         if not isinstance(registries,SLMRegistries):
             raise TypeError("registries must be SLMRegistries or None")
-        if (
-            calibration_store is not None
-            and not isinstance(calibration_store,SLMCalibrationStore)
-        ):
-            raise TypeError("calibration_store must be an SLMCalibrationStore or None")
+        if workspace is not None and not isinstance(workspace,SLMWorkspace):
+            raise TypeError("workspace must be an SLMWorkspace or None")
 
         self.registries = registries
-        self.calibration_store = calibration_store
+        self.workspace = workspace
 
     def create(
         self,
         *,
-        definition: SLMDefinition,
-        correction_store: SLMCorrectionStore | None=None,
-        config_directory: object | None=None,
+        setup: SLMSetup,
         host_services: SLMHostServices | None=None,
         display_name: str="",
         interaction_settings: RuntimeViewInteractionSettings=(
@@ -70,23 +65,26 @@ class SLMQtSessionFactory:
         auto_upload_frame: bool=True,
         parent: QtWidgets.QWidget | None=None,
     ) -> tuple[SLMQtSession, SLMPanel]:
-        if not isinstance(definition,SLMDefinition):
-            raise TypeError("definition must be an SLMDefinition")
-        if (
-            correction_store is not None
-            and not isinstance(correction_store,SLMCorrectionStore)
-        ):
-            raise TypeError(
-                "correction_store must be an SLMCorrectionStore or None"
-            )
-        services = host_services or SLMHostServices()
+        if not isinstance(setup,SLMSetup):
+            raise TypeError("setup must be an SLMSetup")
+
+        workspace = self.workspace
+        defaults = None if workspace is None else workspace.default_host_services(setup)
+        services = (host_services or SLMHostServices()).with_fallbacks(defaults)
         config_repository = (
-            None
-            if config_directory is None
-            else SLMConfigRepository(config_directory,self.registries)
+            None if workspace is None
+            else workspace.config_repository(setup,self.registries)
+        )
+        correction_store = (
+            self._preferred_correction_store(setup)
+            if workspace is None
+            else workspace.correction_store(setup)
+        )
+        calibration_store = (
+            None if workspace is None else workspace.calibration_store
         )
         runtime_factory = SLMRuntimeFactory(
-            definition=definition,
+            setup=setup,
             registries=self.registries,
             correction_store=correction_store,
             config_repository=config_repository,
@@ -117,7 +115,7 @@ class SLMQtSessionFactory:
                 cgh_executor=cgh_executor,
                 auto_upload_frame=auto_upload_frame,
                 display_name=display_name,
-                calibration_store=self.calibration_store,
+                calibration_store=calibration_store,
                 apply_startup_calibration_defaults=(startup.config_path is None),
                 runtime_factory=runtime_factory,
                 config_repository=config_repository,
@@ -136,6 +134,20 @@ class SLMQtSessionFactory:
             if panel is not None:
                 panel.deleteLater()
             raise
+
+    @staticmethod
+    def _preferred_correction_store(setup: SLMSetup) -> SLMCorrectionStore | None:
+        correction_setup = setup.corrections
+        if correction_setup is None or not correction_setup.preferred_directory:
+            return None
+        directory = Path(correction_setup.preferred_directory).expanduser()
+        if not directory.is_dir():
+            return None
+        return SLMCorrectionStore(
+            identity=setup.identity,
+            directory=directory,
+            wavelength_table_file=correction_setup.wavelength_table_file,
+        )
 
     @staticmethod
     def _display_mode(host_services: SLMHostServices) -> SectionsDisplayMode:

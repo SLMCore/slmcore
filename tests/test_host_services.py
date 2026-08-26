@@ -168,3 +168,31 @@ def test_host_services_from_callbacks_requires_complete_preference_pairs():
         SLMHostServices.from_callbacks(set_default_plane=lambda _section,_value:None)
     with pytest.raises(TypeError,match="section display mode"):
         SLMHostServices.from_callbacks(get_section_display_mode=lambda:"tabs")
+
+
+def test_host_services_with_fallbacks_only_fills_missing_capabilities():
+    from slmcore.host import ConfigurationPreferences,SectionViewPreferences
+
+    explicit_view = SectionViewPreferences(
+        get_display_mode=lambda:"horizontal",
+        set_display_mode=lambda _value:None,
+    )
+    fallback_config = ConfigurationPreferences(
+        get_startup_config=lambda:"startup.h5",
+        set_startup_config=lambda _value:None,
+    )
+    fallback_view = SectionViewPreferences(
+        get_display_mode=lambda:"tabs",
+        set_display_mode=lambda _value:None,
+    )
+    services = SLMHostServices(
+        section_view_preferences=explicit_view,
+    ).with_fallbacks(
+        SLMHostServices(
+            configuration_preferences=fallback_config,
+            section_view_preferences=fallback_view,
+        )
+    )
+
+    assert services.configuration_preferences is fallback_config
+    assert services.section_view_preferences is explicit_view
