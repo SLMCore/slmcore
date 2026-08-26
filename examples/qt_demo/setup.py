@@ -1,63 +1,28 @@
-"""Canonical SLM setups used by the standalone Qt demo."""
+"""Canonical JSON setup files used by the standalone Qt demo."""
 
-from slmcore import (
-    SLMGeometry,
-    SLMIdentity,
-    SLMSectionsSetup,
-    SLMSetup,
-    SectionSplitLayout,
-)
+from __future__ import annotations
 
+from pathlib import Path
+import shutil
 
-DISPLAY_NAMES = {
-    "demo_slm_1":"Demo SLM 1 — Single section",
-    "demo_slm_2":"Demo SLM 2 — Two sections",
-}
+from slmcore import SLMSetup,SLMStartupPreferences,load_slm_setup_file
 
 
-def create_demo_setups() -> tuple[SLMSetup,...]:
-    """Return two hardware-free setups that exercise common layouts."""
-    return (
-        _setup(
-            key="demo_slm_1",
-            serial_number="DEMO-001",
-            width=512,
-            height=512,
-            pixel_size_um=8.0,
-            layout=SectionSplitLayout(n_sections=1,axis="x"),
-            customizable=False,
-        ),
-        _setup(
-            key="demo_slm_2",
-            serial_number="DEMO-002",
-            width=512,
-            height=256,
-            pixel_size_um=8.0,
-            layout=SectionSplitLayout(n_sections=2,axis="x"),
-            customizable=True,
-        ),
-    )
+_DEFAULT_SETUP_DIR = Path(__file__).with_name("default_setups")
 
 
-def _setup(
-    *,
-    key: str,
-    serial_number: str,
-    width: int,
-    height: int,
-    pixel_size_um: float,
-    layout: SectionSplitLayout,
-    customizable: bool,
-) -> SLMSetup:
-    return SLMSetup(
-        identity=SLMIdentity(key,serial_number),
-        geometry=SLMGeometry(
-            width=width,
-            height=height,
-            pixel_size_um=pixel_size_um,
-        ),
-        sections=SLMSectionsSetup(
-            layout=layout,
-            customizable=customizable,
-        ),
-    )
+def load_demo_setups(
+    data_dir: str | Path,
+) -> tuple[tuple[Path,SLMSetup,SLMStartupPreferences],...]:
+    """Seed writable demo setup files, then load them through slmcore."""
+    setup_dir = Path(data_dir).expanduser().resolve() / "setups"
+    setup_dir.mkdir(parents=True,exist_ok=True)
+
+    loaded = []
+    for source in sorted(_DEFAULT_SETUP_DIR.glob("*.json")):
+        destination = setup_dir / source.name
+        if not destination.exists():
+            shutil.copyfile(source,destination)
+        setup,preferences = load_slm_setup_file(destination)
+        loaded.append((destination,setup,preferences))
+    return tuple(loaded)

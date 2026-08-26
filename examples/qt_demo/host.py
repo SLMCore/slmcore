@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from slmcore import SLMSetup,SLMWorkspace
+from slmcore import SLMSetup,SLMStartupPreferences,SLMWorkspace
 from slmcore.host import MockSLMDeviceProvider,SLMHostServices
 from slmcore.qt import (
     PreviewContainer,
@@ -17,7 +17,7 @@ from slmcore.qt import (
     SLMQtSessionGroup,
 )
 
-from .setup import DISPLAY_NAMES,create_demo_setups
+from .setup import load_demo_setups
 from .window import DemoMainWindow
 
 
@@ -45,8 +45,8 @@ class DemoHost:
 
     def initialize(self) -> None:
         """Construct, mount and initialize every demo SLM."""
-        for setup in create_demo_setups():
-            self._initialize_slm(setup)
+        for setup_file,setup,preferences in load_demo_setups(self.data_dir):
+            self._initialize_slm(setup_file,setup,preferences)
         self.window.set_control_mode(self.group.control_mode)
         self.window.set_control_mode_change_enabled(
             self.group.can_change_control_mode,
@@ -70,16 +70,23 @@ class DemoHost:
         self.sessions.clear()
         self.devices.clear()
 
-    def _initialize_slm(self,setup: SLMSetup) -> None:
+    def _initialize_slm(
+        self,
+        setup_file: Path,
+        setup: SLMSetup,
+        preferences: SLMStartupPreferences,
+    ) -> None:
         slm_key = setup.identity.key
+        display_name = setup.identity.display_name or slm_key
         if slm_key in self.sessions:
             raise KeyError("SLM %r is already initialized" % slm_key)
 
         device = MockSLMDeviceProvider(requires_explicit_connection=True)
         session,panel = self.factory.create(
             setup=setup,
+            startup_preferences=preferences,
+            setup_file=setup_file,
             host_services=SLMHostServices(device=device),
-            display_name=DISPLAY_NAMES.get(slm_key,slm_key),
             auto_upload_frame=True,
             layout_policy=SLMPanelLayoutPolicy(
                 preview_placement=PreviewPlacement.LEFT,
@@ -94,7 +101,7 @@ class DemoHost:
         try:
             self.window.add_slm(
                 slm_key=slm_key,
-                display_name=DISPLAY_NAMES.get(slm_key,slm_key),
+                display_name=display_name,
                 panel=panel,
             )
             self.sessions[slm_key] = session

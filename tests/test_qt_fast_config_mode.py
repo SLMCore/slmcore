@@ -43,6 +43,7 @@ def _create_session(tmp_path,key="slm",serial="SER123"):
     ).create(
         setup=_setup(key,serial),
         host_services=SLMHostServices(device=device),
+        on_startup_preferences_changed=lambda _preferences:None,
     )
     return session,panel,device
 

@@ -48,8 +48,8 @@ and `cgh/computations/`.
 
 ## Integration layers
 
-- `setup/`: canonical installed-SLM setup model (identity, geometry, sections, corrections, and optional hardware description).
-- `workspace/`: reusable config/calibration/correction/preference persistence rooted at one application data directory.
+- `setup/`: canonical installed-SLM setup and startup-preference models plus JSON helpers.
+- `workspace/`: standard config/calibration/correction resource layout rooted at one application data directory.
 - `config/`: configuration models, serialization, migration, and repositories.
 - `application/`: runtime construction from a canonical `SLMSetup`.
 - `host/`: optional host capability contracts and callbacks.
@@ -60,27 +60,48 @@ used types. Internal architectural modules use the `slmcore.engine.*` paths.
 
 ## Canonical setup and workspace
 
-`SLMSetup` is the public setup contract. It stores the physical identity and
-geometry plus the declared section layout and optional installed correction /
-hardware information. Section geometries are derived by slmcore rather than by
-the embedding host. `SLMIdentity.serial_number` is mandatory and is the stable
-physical namespace for persistent workspace data; `key` remains the logical
-runtime identifier.
+`SLMSetup` is the public installed-SLM contract. It stores logical/physical
+identity, human-readable display name, geometry, declared section layout and
+optional hardware information. Section geometries are derived by slmcore rather
+than by the embedding host. `SLMIdentity.serial_number` is mandatory and is the
+stable physical namespace for persistent workspace resources; `key` remains the
+logical runtime identifier. `display_name` is presentation-only and does not
+participate in identity matching.
 
-`SLMWorkspace(root)` provides the standard persistence implementation for a
-standalone or embedded application. Configs are stored per serial number, while
-calibration definitions and preferences are shared by the workspace. Correction
-resources preserve the established resolution behavior: an existing configured
-preferred directory wins, otherwise an existing workspace correction directory
-for the serial number is used; missing correction directories are not created
-automatically.
+`SLMStartupPreferences` stores persistent defaults applied when constructing a
+session: startup config, default active plane per section and section display
+mode. A canonical standalone JSON file contains both `setup` and
+`startup_preferences`. Hosts with a larger setup format may embed the same two
+objects and use `to_dict()` / `from_dict()` directly.
+
+`SLMWorkspace(root)` is the standard runtime-resource layout:
+
+```text
+<root>/
+├── configs/<serial>/
+├── corrections/<serial>/
+└── calibrations/
+```
+
+Normally the host supplies only `root`; slmcore owns the rest. Advanced hosts
+may override `configs_dir`, `corrections_dir` and/or `calibrations_dir` when
+constructing the workspace. Correction lookup uses the standard per-serial
+directory and `wavelength.json`; missing correction data simply follows the
+normal correction-store fallback behavior.
 
 The normal Qt composition is therefore:
 
 ```python
 workspace = SLMWorkspace(data_dir)
 factory = SLMQtSessionFactory(workspace=workspace)
-session, panel = factory.create(setup=setup, host_services=services)
+session, panel = factory.create(
+    setup=setup,
+    startup_preferences=startup_preferences,
+    setup_file=setup_file,  # standard standalone JSON persistence
+    host_services=services,
+)
 ```
 
-Explicit host preference capabilities still override the workspace defaults.
+If the host owns a larger setup file, it omits `setup_file` and supplies
+`on_startup_preferences_changed`; slmcore owns preference semantics while the
+host owns how its setup file is rewritten.

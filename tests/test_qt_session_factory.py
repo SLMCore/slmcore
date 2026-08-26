@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from slmcore import (
@@ -6,13 +8,11 @@ from slmcore import (
     SLMIdentity,
     SLMSectionsSetup,
     SLMSetup,
+    SLMStartupPreferences,
     SLMWorkspace,
 )
 from slmcore.application import SLMRuntimeFactory
-from slmcore.host import (
-    ConfigurationPreferences,SectionViewPreferences,SLMDeviceProvider,
-    SLMHostServices,
-)
+from slmcore.host import SLMDeviceProvider,SLMHostServices
 from slmcore.engine.section import SectionSplitLayout
 
 
@@ -31,7 +31,7 @@ def _app():
 
 def _setup():
     return SLMSetup(
-        identity=SLMIdentity("slm","SER123"),
+        identity=SLMIdentity("slm","SER123","Test SLM"),
         geometry=SLMGeometry(width=24,height=12,pixel_size_um=1.0),
         sections=SLMSectionsSetup(
             layout=SectionSplitLayout(n_sections=2,axis="x"),
@@ -48,6 +48,19 @@ def _runtime(setup,repository=None):
     ).create_default()
 
 
+def _discard(_preferences):
+    pass
+
+
+def _write_setup_file(path,setup,preferences=None):
+    preferences = preferences or SLMStartupPreferences()
+    path.write_text(json.dumps({
+        "schema_version":1,
+        "setup":setup.to_dict(),
+        "startup_preferences":preferences.to_dict(),
+    }),encoding="utf-8")
+
+
 def test_session_factory_constructs_default_session_and_panel():
     _app()
     from slmcore.qt import SLMPanel,SLMQtSession,SLMQtSessionFactory
@@ -56,7 +69,7 @@ def test_session_factory_constructs_default_session_and_panel():
     factory = SLMQtSessionFactory()
     session,panel = factory.create(
         setup=setup,
-        display_name="Test SLM",
+        on_startup_preferences_changed=_discard,
     )
     try:
         assert isinstance(session,SLMQtSession)
@@ -72,7 +85,7 @@ def test_session_factory_constructs_default_session_and_panel():
         panel.deleteLater()
 
 
-def test_session_factory_uses_workspace_startup_config_and_view_preference(tmp_path):
+def test_session_factory_uses_startup_preferences(tmp_path):
     _app()
     from slmcore.qt import SectionsDisplayMode,SLMQtSessionFactory
 
@@ -81,11 +94,17 @@ def test_session_factory_uses_workspace_startup_config_and_view_preference(tmp_p
     repository = workspace.config_repository(setup,DEFAULT_REGISTRIES)
     runtime = _runtime(setup,repository)
     repository.save("startup.h5",runtime.create_config(),"startup",overwrite=False)
-    workspace.preference_store.set_startup_config("SER123","startup.h5")
-    workspace.preference_store.set_section_display_mode("SER123","horizontal")
+    preferences = SLMStartupPreferences(
+        startup_config="startup.h5",
+        section_display_mode="horizontal",
+    )
 
     factory = SLMQtSessionFactory(workspace=workspace)
-    session,panel = factory.create(setup=setup)
+    session,panel = factory.create(
+        setup=setup,
+        startup_preferences=preferences,
+        on_startup_preferences_changed=_discard,
+    )
     try:
         assert session.current_config_path == str(repository.resolve("startup.h5"))
         assert session.config_repository is repository
@@ -97,27 +116,34 @@ def test_session_factory_uses_workspace_startup_config_and_view_preference(tmp_p
         panel.deleteLater()
 
 
-def test_explicit_host_preferences_override_workspace_defaults(tmp_path):
+def test_factory_automatically_persists_preferences_to_setup_file(tmp_path):
     _app()
-    from slmcore.qt import SectionsDisplayMode,SLMQtSessionFactory
+    from slmcore.qt import SLMQtSessionFactory
 
     setup = _setup()
-    workspace = SLMWorkspace(tmp_path)
-    workspace.preference_store.set_section_display_mode("SER123","tabs")
-    services = SLMHostServices(
-        section_view_preferences=SectionViewPreferences(
-            get_display_mode=lambda:"horizontal",
-            set_display_mode=lambda _value:None,
-        ),
-    )
+    path = tmp_path / "slm.json"
+    _write_setup_file(path,setup)
+    workspace = SLMWorkspace(tmp_path / "workspace")
     session,panel = SLMQtSessionFactory(workspace=workspace).create(
-        setup=setup,host_services=services,
+        setup=setup,
+        startup_preferences=SLMStartupPreferences(),
+        setup_file=path,
     )
     try:
-        assert panel.section_host.display_mode == SectionsDisplayMode.HORIZONTAL
+        session.startup_preferences.set_section_display_mode("horizontal")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["startup_preferences"]["section_display_mode"] == "horizontal"
     finally:
         session.dispose()
         panel.deleteLater()
+
+
+def test_factory_requires_persistence_path_or_host_callback():
+    _app()
+    from slmcore.qt import SLMQtSessionFactory
+
+    with pytest.raises(ValueError,match="setup_file"):
+        SLMQtSessionFactory().create(setup=_setup())
 
 
 def test_session_factory_surfaces_startup_warning_without_workspace():
@@ -125,14 +151,10 @@ def test_session_factory_surfaces_startup_warning_without_workspace():
     from slmcore.qt import SLMQtSessionFactory
 
     setup = _setup()
-    services = SLMHostServices(
-        configuration_preferences=ConfigurationPreferences(
-            get_startup_config=lambda:"missing.h5",
-            set_startup_config=lambda _value:None,
-        ),
-    )
     session,panel = SLMQtSessionFactory().create(
-        setup=setup,host_services=services,
+        setup=setup,
+        startup_preferences=SLMStartupPreferences(startup_config="missing.h5"),
+        on_startup_preferences_changed=_discard,
     )
     try:
         assert "configuration storage is not configured" in (
@@ -154,6 +176,7 @@ def test_session_factory_does_not_initialize_device():
     session,panel = SLMQtSessionFactory().create(
         setup=_setup(),
         host_services=SLMHostServices(device=device),
+        on_startup_preferences_changed=_discard,
     )
     try:
         assert uploads == []
@@ -185,7 +208,10 @@ def test_session_factory_cleans_panel_when_session_construction_fails(monkeypatc
 
     factory = factory_module.SLMQtSessionFactory()
     with pytest.raises(RuntimeError,match="session construction failed"):
-        factory.create(setup=_setup())
+        factory.create(
+            setup=_setup(),
+            on_startup_preferences_changed=_discard,
+        )
     assert deleted == [True]
 
 
@@ -196,7 +222,10 @@ def test_session_factory_accepts_custom_registries():
 
     registries = SLMRegistries()
     factory = SLMQtSessionFactory(registries=registries)
-    session,panel = factory.create(setup=_setup())
+    session,panel = factory.create(
+        setup=_setup(),
+        on_startup_preferences_changed=_discard,
+    )
     try:
         assert session.runtime_factory.registries is registries
     finally:

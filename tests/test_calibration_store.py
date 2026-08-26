@@ -6,7 +6,7 @@ from slmcore.calibration import (
     SLMCalibrationStore,SLMSectionCalibration,section_geometry_to_dict,
 )
 from slmcore.engine.section import SectionGeometry
-from slmcore.host import CalibrationPreferences
+from slmcore import SLMStartupPreferences
 
 
 def test_calibration_store_owns_plane_catalog_and_section_files(tmp_path):
@@ -49,13 +49,10 @@ def test_calibration_store_owns_plane_catalog_and_section_files(tmp_path):
     assert len(changes) == 2
 
 
-def test_calibration_preferences_normalizes_empty_plane_names():
-    values = {"sec_0":"Plane A"}
-    preferences = CalibrationPreferences(
-        get_default_plane=lambda key:values.get(key),
-        set_default_plane=lambda key,value:values.__setitem__(key,value),
+def test_startup_preferences_normalizes_empty_plane_names():
+    preferences = SLMStartupPreferences(
+        default_planes={"sec_0":"Plane A","sec_1":""},
     )
 
-    assert preferences.get("sec_0") == "Plane A"
-    preferences.set("sec_0","")
-    assert values["sec_0"] is None
+    assert preferences.default_planes["sec_0"] == "Plane A"
+    assert "sec_1" not in preferences.default_planes
