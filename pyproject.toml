@@ -15,16 +15,15 @@ dependencies = [
     "scipy>=1.10",
     "h5py>=3.8",
     "Pillow>=9.5",
+    "qtpy>=2.4",
+    "PyQt5>=5.15",
+    "pyqtgraph>=0.13",
+    "matplotlib>=3.7",
+    "QDarkStyle>=3.2",
 ]
 
 
 [project.optional-dependencies]
-qt = [
-    "qtpy>=2.4",
-    "pyqtgraph>=0.13",
-    "matplotlib>=3.7",
-]
-
 test = [
     "pytest>=7",
 ]

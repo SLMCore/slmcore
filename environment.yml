@@ -18,6 +18,7 @@ dependencies:
   - pyqtgraph
   - pyqt=5
   - matplotlib-base
+  - qdarkstyle
 
   # tests
   - pytest
