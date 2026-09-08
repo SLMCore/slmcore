@@ -539,7 +539,7 @@ def test_intensity_preview_toggle_and_reuse_policy_follow_round_state():
         assert image_combo.findData("Integration") >= 0
         assert image_combo.isEnabled()
         assert window.reuse_localization_checkbox.isChecked()
-        assert not window.reuse_localization_checkbox.isEnabled()
+        assert window.reuse_localization_checkbox.isEnabled()
 
         result_view.show_detected.setChecked(False)
         image_combo.setCurrentIndex(image_combo.findData("Integration"))
@@ -695,18 +695,17 @@ def test_position_tab_uses_right_controls_and_pending_position_is_actionable():
         assert position_tab.layout().count() == 2
 
         controls_parent = window.position_apply_button.parentWidget()
-        assert controls_parent is window.position_toggle_button.parentWidget()
         assert controls_parent is window.position_clear_button.parentWidget()
+        assert not hasattr(window,"position_toggle_button")
         assert controls_parent.minimumWidth() == 175
         assert controls_parent.maximumWidth() == 220
 
         assert (
             window.position_status_label.text()
-            == "Correction active · hologram pending"
+            == "Correction ready · hologram pending"
         )
         assert not window.position_apply_button.isEnabled()
         assert window._compute_adapted_buttons[1].isEnabled()
-        assert window.position_toggle_button.isEnabled()
         assert window.position_clear_button.isEnabled()
 
         legend_texts = [
@@ -802,6 +801,53 @@ def test_position_history_selector_separates_reference_from_intensity_rounds():
         window.position_selector.setCurrentIndex(corrected_index)
         assert window.round_selector.isEnabled()
         assert window.round_selector.currentData() == "working:0"
+    finally:
+        window.close()
+        window.deleteLater()
+
+
+def test_geometry_measurement_survives_inactive_automatic_state_refresh():
+    runtime,section_key = _runtime()
+    _commit_job(runtime,section_key)
+    _QtWidgets,window = _window(runtime,section_key)
+    try:
+        window.feedback_tabs.setCurrentIndex(2)
+        measurement = ImageMeasurement(
+            image=np.arange(64*64,dtype=np.float64).reshape(64,64),
+            source="geometry-test",
+        )
+        window.set_geometry_orientation_calibration_state({
+            "plane_name":"sample",
+            "calibrated":False,
+            "grid_x":5,
+            "grid_y":4,
+            "period_x_px":10.0,
+            "period_y_px":12.0,
+            "metric_periods_available":False,
+            "computed":True,
+            "frame_active":True,
+            "any_frame_active":True,
+            "measurement":measurement,
+            "localization":None,
+            "localization_parameters":{},
+            "localization_context":{},
+            "analysis":None,
+            "analyze_enabled":False,
+            "save_enabled":False,
+        })
+        assert window.measurement_view.measurement is measurement
+        assert window.measurement_view._workbench.run_button.isEnabled()
+
+        # Coordinator synchronization always reapplies the automatic-operation
+        # state. When inactive, that refresh must not restore/clear the normal
+        # feedback round into the geometry-owned workbench.
+        window.set_automatic_operation_state(False)
+
+        assert window.measurement_view.measurement is measurement
+        assert window.measurement_view._workbench.run_button.isEnabled()
+        image = window.measurement_view._workbench.result_view._acquisition_image
+        assert image is not None
+        assert image.shape == measurement.image.shape
     finally:
         window.close()
         window.deleteLater()

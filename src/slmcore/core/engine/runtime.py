@@ -371,10 +371,10 @@ class SLMRuntime:
         ).get_base_target_localization_reference()
 
     def compute_section_feedback_intensity_analysis(
-        self,key: str,localization=None,
+        self,key: str,localization=None,*,orientation="identity",
     ):
         return self._get_section(key).compute_feedback_intensity_analysis(
-            localization,
+            localization,orientation=orientation,
         )
 
     def set_section_feedback_intensity_analysis(
@@ -383,10 +383,10 @@ class SLMRuntime:
         self._get_section(key).set_feedback_intensity_analysis(analysis)
 
     def compute_section_feedback_measurement_metrics(
-        self,key: str,localization=None,
+        self,key: str,localization=None,*,orientation="identity",
     ):
         return self._get_section(key).compute_feedback_measurement_metrics(
-            localization,
+            localization,orientation=orientation,
         )
 
     def set_section_feedback_measurement_metrics(self,key: str,metrics) -> None:
@@ -508,6 +508,30 @@ class SLMRuntime:
         """Prepare a fresh base CGH transactionally."""
         return self._get_section(key).prepare_base_cgh()
 
+    def prepare_section_geometry_orientation_cgh(
+        self,
+        key: str,
+        *,
+        grid_x: int,
+        grid_y: int,
+        period_x_px: float,
+        period_y_px: float,
+    ):
+        """Return detached section candidate + job for geometry calibration."""
+        return self._get_section(key).prepare_geometry_orientation_cgh(
+            grid_x=grid_x,grid_y=grid_y,
+            period_x_px=period_x_px,period_y_px=period_y_px,
+        )
+
+    def compose_transient_section_frame(self,key: str,section: SLMSectionRuntime) -> np.ndarray:
+        """Compose one detached section candidate into a full-SLM frame."""
+        current=self._get_section(key)
+        if section.geometry != current.geometry:
+            raise ValueError("Transient section geometry does not match runtime section")
+        return np.array(
+            self._compose({key:section},frame_changed_keys=(key,)).eightbit,copy=True,
+        )
+
     def prepare_section_adapted_cgh(self,key: str) -> CGHJob:
         """Prepare exactly the pending feedback-adapted round."""
         return self._get_section(key).prepare_adapted_cgh()
@@ -530,10 +554,33 @@ class SLMRuntime:
         self,key: str,
         *,
         reset_intensity: bool=False,
+        orientation="identity",
+        reference_positions_px=None,
+        reference_metadata=None,
     ) -> SectionStateTransition | None:
         return self._apply_feedback_resolution_operation(
             key,"apply_position_correction",
-            reset_intensity=reset_intensity,
+            reset_intensity=reset_intensity,orientation=orientation,
+            reference_positions_px=reference_positions_px,
+            reference_metadata=reference_metadata,
+        )
+
+    def compute_section_feedback_position_analysis(
+        self,key: str,*,orientation="identity",reference_positions_px=None,
+    ):
+        return self._get_section(key).compute_feedback_position_analysis(
+            orientation=orientation,
+            reference_positions_px=reference_positions_px,
+        )
+
+    def get_section_fov_position_context(self,key: str):
+        return self._get_section(key).get_fov_position_context()
+
+    def set_section_fov_position_calibration(
+        self,key: str,calibration,
+    ) -> SectionStateTransition | None:
+        return self._apply_feedback_resolution_operation(
+            key,"set_fov_position_calibration",calibration,
         )
 
     def set_section_position_correction_active(

@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import numpy as np
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any,Callable,Mapping
@@ -47,6 +47,7 @@ class SLMSessionCallbacks:
     on_error: Callable[[str,Exception],None] = _noop
     on_upload_failed: Callable[[Exception],None] = _noop
     on_upload_state_changed: Callable[[bool,Exception | None],None] = _noop
+    on_device_connection_changed: Callable[[DeviceConnectionResult],None] = _noop
     on_runtime_replaced: Callable[[SLMRuntime],None] = _noop
     on_config_committed: Callable[[ConfigLoadOutcome],None] = _noop
     on_control_mode_changed: Callable[[SLMControlMode,str | None],None] = _noop
@@ -93,6 +94,9 @@ class SLMSession:
         current_config_path: str | None=None,
         measurement_dispatcher: MeasurementDispatcher | None=None,
         calibration_store=None,
+        position_reference_store=None,
+        fov_position_calibration_store=None,
+        geometry_orientation_calibration_store=None,
         startup_preferences=None,
         display_name: str="",
         apply_startup_calibration_defaults: bool=False,
@@ -129,6 +133,9 @@ class SLMSession:
             self,
             measurements=measurement_dispatcher,
             callbacks=self._feedback_callbacks(),
+            position_reference_store=position_reference_store,
+            fov_position_calibration_store=fov_position_calibration_store,
+            geometry_orientation_calibration_store=geometry_orientation_calibration_store,
         )
         self.calibration = SLMCalibrationService(
             self,
@@ -474,6 +481,7 @@ class SLMSession:
         if device is None:
             raise RuntimeError("No SLM device provider is configured")
         result = device.connect()
+        self._notify("on_device_connection_changed",result)
         if result.connected and upload_current_frame:
             self.upload_current_frame()
         return result
@@ -483,7 +491,45 @@ class SLMSession:
         device = self.host_services.device
         if device is None:
             raise RuntimeError("No SLM device provider is configured")
-        return device.disconnect()
+        result = device.disconnect()
+        self._notify("on_device_connection_changed",result)
+        return result
+
+    def reconnect_device(self) -> DeviceConnectionResult:
+        """Reconnect the configured device and restore the active frame.
+
+        The operation is owned by the toolkit-independent application session
+        so hosts can request reconnect without bypassing session state. For
+        explicit devices, an existing connection is disconnected first. A
+        successful reconnect always uploads the frame that is authoritative for
+        the current control mode (the active compiled frame in Fast Config mode,
+        otherwise the current runtime frame).
+        """
+        self._require_active()
+        device = self.host_services.device
+        if device is None:
+            raise RuntimeError("No SLM device provider is configured")
+
+        if device.requires_explicit_connection:
+            disconnected = self.disconnect_device()
+            if disconnected.connected:
+                return disconnected
+            connected = self.connect_device(upload_current_frame=False)
+        else:
+            connected = DeviceConnectionResult(connected=True)
+            self._notify("on_device_connection_changed",connected)
+
+        if connected.connected:
+            self._upload_active_device_frame()
+        return connected
+
+    def _upload_active_device_frame(self) -> bool:
+        if self.control_mode is SLMControlMode.FAST_CONFIG and self.fast_config_path:
+            _resolved,frame = self._read_validated_compiled_frame(
+                self.fast_config_path
+            )
+            return self.upload_frame(frame)
+        return self.upload_current_frame()
 
     def set_measurement_dispatcher(
         self,measurements: MeasurementDispatcher | None,
@@ -679,6 +725,88 @@ class SLMSession:
             preparation_title="Adapted CGH preparation failed",
             on_finished=on_finished,
         )
+
+    def compute_geometry_orientation_cgh(
+        self,
+        section_key: str,
+        *,
+        grid_x: int,
+        grid_y: int,
+        period_x_px: float,
+        period_y_px: float,
+        on_finished: Callable[[bool,Exception | None,Mapping[str,Any] | None],None] | None=None,
+    ) -> bool:
+        """Compute an isolated calibration CGH without committing experiment state."""
+        self._require_active()
+        self._require_editor_mode()
+        self._require_section(section_key)
+        if self.is_cgh_computing(section_key):
+            if on_finished is not None:
+                on_finished(False,RuntimeError("CGH computation is already running"),None)
+            return False
+        executor=self._cgh_executor
+        if executor is None:
+            error=RuntimeError("No CGH executor is configured")
+            if on_finished is not None:on_finished(False,error,None)
+            return False
+        try:
+            candidate,job=self.runtime.prepare_section_geometry_orientation_cgh(
+                section_key,grid_x=grid_x,grid_y=grid_y,
+                period_x_px=period_x_px,period_y_px=period_y_px,
+            )
+        except Exception as error:
+            if on_finished is not None:on_finished(False,error,None)
+            return False
+
+        self._request_counter += 1
+        request_id=self._request_counter
+        active=_ActiveCGHRequest(
+            request_id=request_id,generation=int(job.generation),on_finished=None,
+        )
+        self._active_cgh_requests[section_key]=active
+        self._notify("on_cgh_computing_changed",section_key,True)
+
+        def finish(success,error,payload=None):
+            current=self._active_cgh_requests.get(section_key)
+            if current is None or current.request_id != request_id:
+                return
+            self._finish_cgh_request(section_key,request_id)
+            if on_finished is not None:
+                on_finished(bool(success),error,payload)
+
+        def result_callback(result):
+            try:
+                if not candidate.commit_cgh(result):
+                    raise RuntimeError("Transient geometry CGH could not be committed")
+                frame=self.runtime.compose_transient_section_frame(section_key,candidate)
+                payload={
+                    "frame":frame,
+                    "localization_context":candidate.get_feedback_localization_context(),
+                    "target_intensities":np.array(job.resolution.spot_intensities,copy=True),
+                    "lattice_indices":np.array(job.resolution.lattice_indices,copy=True),
+                    "target_type":job.spec.target_type,
+                    "target_params":dict(job.spec.target_params),
+                    "resolution":job.resolution,
+                    "calibration":candidate.calibration,
+                }
+                finish(True,None,payload)
+            except Exception as error:
+                finish(False,error,None)
+
+        def error_callback(error):
+            if not isinstance(error,Exception):
+                error=RuntimeError(str(error))
+            finish(False,error,None)
+
+        try:
+            handle=executor.submit(job,result_callback,error_callback)
+            current=self._active_cgh_requests.get(section_key)
+            if current is not None and current.request_id == request_id:
+                current.handle=handle
+        except Exception as error:
+            finish(False,error,None)
+            return False
+        return True
 
     def _start_cgh_compute(
         self,
@@ -916,9 +1044,17 @@ class SLMSession:
             self.calibration.session_state_changed()
         self._notify("on_automatic_feedback_changed",state)
 
+    def _on_calibration_planes_changed(self) -> None:
+        # A plane switch changes which saved feedback orientation applies.
+        # Preserve transient test values while the plane is unchanged, but
+        # discard them when the active plane context actually changes.
+        self.feedback.refresh_feedback_orientation_contexts()
+        self.feedback.refresh_fov_position_calibration_contexts()
+        self._notify("on_calibration_planes_changed")
+
     def _calibration_callbacks(self) -> SLMCalibrationCallbacks:
         return SLMCalibrationCallbacks(
-            on_planes_changed=lambda:self._notify("on_calibration_planes_changed"),
+            on_planes_changed=self._on_calibration_planes_changed,
             on_state_changed=lambda key:self._notify(
                 "on_calibration_state_changed",key,
             ),

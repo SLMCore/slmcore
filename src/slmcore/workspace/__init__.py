@@ -7,6 +7,9 @@ from .config_store import (
     SLMConfigStore,
 )
 from .correction_store import SLMCorrectionStore
+from .position_reference_store import SLMPositionReferenceStore
+from .fov_position_calibration_store import SLMFOVPositionCalibrationStore
+from .geometry_orientation_calibration_store import SLMGeometryOrientationCalibrationStore
 from .workspace import SLMWorkspace
 
 __all__ = [
@@ -17,5 +20,8 @@ __all__ = [
     "SLMConfigMetadata",
     "SLMConfigStore",
     "SLMCorrectionStore",
+    "SLMPositionReferenceStore",
+    "SLMFOVPositionCalibrationStore",
+    "SLMGeometryOrientationCalibrationStore",
     "SLMWorkspace",
 ]

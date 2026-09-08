@@ -9,10 +9,33 @@ and render the callbacks emitted after authoritative application changes.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any,Callable,Mapping,Protocol,Sequence,TYPE_CHECKING
 
+import numpy as np
+
 from ..core.cgh.execution.status import CGHResultState
+from ..core.cgh.feedback import (
+    EditablePositionReferenceGeometry,
+    FeedbackCapability,
+    FeedbackOrientation,
+    FOVPositionCalibration,
+    GeometryOrientationCalibration,
+    GeometryOrientationAnalysis,
+    analyze_geometry_orientation,
+    PositionReference,
+    PositionReferenceMode,
+    fit_center_reference_geometry,
+    editable_position_reference_geometry,
+    editable_reference_center_px,
+    editable_reference_positions,
+    localization_positions_full_px,
+    orient_localization,
+    reference_positions_for_localization,
+)
+from ..core.cgh.localization import infer_missing_localization,localize_measurement
 from ..core.cgh.localization.policy import suggest_localization_sources
+from ..core.cgh.coordinates import reference_px_to_k,k_to_reference_px
 from ..core.cgh.propagation import simulate_propagation_fft
 from ..core.measurement import ImageMeasurement
 
@@ -22,6 +45,27 @@ if TYPE_CHECKING:
 
 def _noop(*_args,**_kwargs) -> None:
     return None
+
+
+_EDITABLE_POSITION_REFERENCE_LOCK_FIELDS = frozenset({
+    "period_x_px","period_y_px","rotation_deg","lattice_angle_deg",
+})
+
+
+def _normalize_editable_locks(value: Any) -> frozenset[str]:
+    if value is None:
+        return frozenset()
+    if isinstance(value,Mapping):
+        names = {str(name) for name,locked in value.items() if bool(locked)}
+    else:
+        names = {str(name) for name in value}
+    unknown = names-_EDITABLE_POSITION_REFERENCE_LOCK_FIELDS
+    if unknown:
+        raise ValueError(
+            "Unknown editable reference lock(s): %s"
+            % ", ".join(sorted(unknown))
+        )
+    return frozenset(names)
 
 
 class MeasurementRequest(Protocol):
@@ -78,6 +122,82 @@ class AutomaticFeedbackState:
 class FeedbackParameterUpdateResult:
     changed: bool
     candidate_analysis: Any=None
+
+
+@dataclass(frozen=True)
+class FeedbackOrientationContext:
+    """Current transient orientation and its persistent plane/default context."""
+
+    orientation: FeedbackOrientation
+    saved_orientation: FeedbackOrientation
+    plane_name: str | None=None
+    plane_override: bool=False
+    calibrated: bool=False
+    change_allowed: bool=True
+    change_unavailable_reason: str=""
+
+    @property
+    def save_needed(self) -> bool:
+        return self.orientation is not self.saved_orientation
+
+
+@dataclass
+class _GeometryCalibrationWorkflow:
+    grid_x: int=5
+    grid_y: int=4
+    period_x_px: float | None=None
+    period_y_px: float | None=None
+    payload: dict[str,Any] | None=None
+    measurement: ImageMeasurement | None=None
+    localization: Any=None
+    localization_parameters: dict[str,Any] | None=None
+    analysis: GeometryOrientationAnalysis | None=None
+    detector_name: str | None=None
+    frame_active: bool=False
+
+
+@dataclass(frozen=True)
+class PositionReferenceSelection:
+    """Transient per-section/plane position-reference choice."""
+
+    mode: PositionReferenceMode=PositionReferenceMode.GLOBAL_FIT
+    saved_name: str | None=None
+    editable_geometry: EditablePositionReferenceGeometry | None=None
+    editable_locks: frozenset[str]=frozenset()
+
+    def __post_init__(self) -> None:
+        mode = PositionReferenceMode.normalize(self.mode)
+        saved_name = (
+            None
+            if self.saved_name is None or not str(self.saved_name).strip()
+            else str(self.saved_name).strip()
+        )
+        geometry = self.editable_geometry
+        if geometry is not None and not isinstance(geometry,EditablePositionReferenceGeometry):
+            geometry = EditablePositionReferenceGeometry.from_mapping(geometry)
+        locks = _normalize_editable_locks(self.editable_locks)
+        if mode is PositionReferenceMode.SAVED and saved_name is None:
+            raise ValueError("Saved position-reference mode requires a name")
+        object.__setattr__(self,"mode",mode)
+        object.__setattr__(self,"saved_name",saved_name)
+        object.__setattr__(self,"editable_geometry",geometry)
+        object.__setattr__(self,"editable_locks",locks)
+
+
+@dataclass(frozen=True)
+class PositionReferenceContext:
+    """UI-facing position-reference state for one feedback section."""
+
+    selection: PositionReferenceSelection
+    plane_name: str | None
+    saved_names: tuple[str,...]=()
+    compatible: bool=True
+    compatibility_error: str=""
+    change_allowed: bool=True
+    change_unavailable_reason: str=""
+    save_allowed: bool=False
+    save_unavailable_reason: str=""
+    fit_geometry: EditablePositionReferenceGeometry | None=None
 
 
 @dataclass(frozen=True)
@@ -366,11 +486,47 @@ class SLMFeedbackService:
         *,
         measurements: MeasurementDispatcher | None=None,
         callbacks: SLMFeedbackCallbacks | None=None,
+        position_reference_store=None,
+        fov_position_calibration_store=None,
+        geometry_orientation_calibration_store=None,
     ) -> None:
         self.session = session
         self.measurements = measurements
         self._callbacks = callbacks or SLMFeedbackCallbacks()
         self._measurement_requests: dict[str,MeasurementRequest] = {}
+        # Runtime/test orientation is deliberately separate from startup
+        # preferences. It is scoped to the currently active plane and only
+        # becomes persistent through save_feedback_orientation().
+        self._feedback_orientations: dict[
+            str,tuple[str | None,FeedbackOrientation]
+        ] = {}
+        self._position_reference_store = position_reference_store
+        self._fov_position_calibration_store = fov_position_calibration_store
+        self._geometry_orientation_calibration_store = geometry_orientation_calibration_store
+        self._geometry_calibration_workflows: dict[
+            tuple[str,str | None],_GeometryCalibrationWorkflow
+        ] = {}
+        self._fov_position_calibration_selections: dict[
+            tuple[str,str | None],dict[str,Any]
+        ] = {}
+        self._fov_position_calibration_candidates: dict[
+            tuple[str,str | None],FOVPositionCalibration
+        ] = {}
+        self._position_reference_selections: dict[
+            tuple[str,str | None],PositionReferenceSelection
+        ] = {}
+        if self._position_reference_store is not None:
+            self._position_reference_store.add_listener(
+                self._on_position_reference_store_changed
+            )
+        if self._fov_position_calibration_store is not None:
+            self._fov_position_calibration_store.add_listener(
+                self._on_fov_position_calibration_store_changed
+            )
+        if self._geometry_orientation_calibration_store is not None:
+            self._geometry_orientation_calibration_store.add_listener(
+                self._on_geometry_orientation_calibration_store_changed
+            )
         self._automatic = AutomaticFeedbackRunner(self)
 
     def set_callbacks(self,callbacks: SLMFeedbackCallbacks | None) -> None:
@@ -431,6 +587,1273 @@ class SLMFeedbackService:
         if measurements is None:
             return None
         return measurements.preferred_source(section_key,available)
+
+    def _active_feedback_plane(self,section_key: str) -> str | None:
+        calibration = getattr(self.session,"calibration",None)
+        if calibration is None:
+            return None
+        plane = calibration.active_plane(section_key)
+        return str(plane or "").strip() or None
+
+    def _saved_feedback_orientation(
+        self,section_key: str,plane_name: str | None,
+    ) -> FeedbackOrientation:
+        calibration = self.geometry_orientation_calibration(
+            section_key,plane_name=plane_name,
+        )
+        if calibration is not None:
+            return calibration.orientation
+        preferences = self.session.startup_preferences
+        value = (
+            "identity" if preferences is None
+            else preferences.feedback_orientation(section_key,plane_name)
+        )
+        return FeedbackOrientation.normalize(value)
+
+    def geometry_orientation_calibration(
+        self,section_key: str,*,plane_name: str | None=None,
+    ) -> GeometryOrientationCalibration | None:
+        section=str(section_key)
+        plane=(self._active_feedback_plane(section) if plane_name is None else str(plane_name or '').strip() or None)
+        store=self._geometry_orientation_calibration_store
+        if plane is None or store is None:
+            return None
+        identity=self.session.runtime.identity
+        if not store.exists(identity,section,plane):
+            return None
+        return store.load(identity,section,plane)
+
+    def _geometry_calibration_key(self,section_key: str) -> tuple[str,str | None]:
+        section=str(section_key)
+        return section,self._active_feedback_plane(section)
+
+    def _active_geometry_calibration_frame(
+        self,section_key: str,
+    ) -> tuple[str | None,_GeometryCalibrationWorkflow] | None:
+        section=str(section_key)
+        for (workflow_section,plane),workflow in self._geometry_calibration_workflows.items():
+            if workflow_section == section and workflow.frame_active:
+                return plane,workflow
+        return None
+
+    def _geometry_period_guess_px(
+        self,section_key: str,grid_x: int,grid_y: int,
+    ) -> tuple[float,float]:
+        state=self.session.runtime.get_section_state_copy(section_key)
+        selected=state.cgh.selected_target
+        params={}
+        if selected is not None and selected in state.cgh.items:
+            params=dict(state.cgh.items[selected].params.values)
+        fx=float(params.get('fov_x_px') or 0.0)
+        fy=float(params.get('fov_y_px') or 0.0)
+        if fx > 0 and fy > 0:
+            return (0.5*fx/max(1,int(grid_x)-1),0.5*fy/max(1,int(grid_y)-1))
+        px=float(params.get('period_x_px') or 6.0)
+        py=float(params.get('period_y_px') or 6.0)
+        return px,py
+
+    def _geometry_period_to_um(self,section_key: str,value: float,axis: str) -> float | None:
+        calibration=self.session.runtime.get_section_calibration_copy(section_key)
+        if calibration is None or not calibration.is_valid():
+            return None
+        k=reference_px_to_k(float(value))
+        x,y=((k,0.0) if axis == 'x' else (0.0,k))
+        dx,dy=calibration.kxy_to_um(x,y)
+        return float(dx if axis == 'x' else dy)
+
+    def geometry_period_from_um(self,section_key: str,value_um: float,axis: str) -> float:
+        calibration=self.session.runtime.get_section_calibration_copy(section_key)
+        if calibration is None or not calibration.is_valid():
+            raise RuntimeError('A valid section/plane FOV calibration is required for metric geometry periods.')
+        x,y=((float(value_um),0.0) if axis == 'x' else (0.0,float(value_um)))
+        kx,ky=calibration.um_to_kxy(x,y)
+        return float(k_to_reference_px(kx if axis == 'x' else ky))
+
+    def geometry_orientation_calibration_context(self,section_key: str) -> dict[str,Any]:
+        section=str(section_key)
+        plane=self._active_feedback_plane(section)
+        key=(section,plane)
+        workflow=self._geometry_calibration_workflows.get(key)
+        if workflow is None:
+            gx,gy=5,4
+            px,py=self._geometry_period_guess_px(section,gx,gy)
+            workflow=_GeometryCalibrationWorkflow(grid_x=gx,grid_y=gy,period_x_px=px,period_y_px=py)
+            self._geometry_calibration_workflows[key]=workflow
+        calibration=self.geometry_orientation_calibration(section,plane_name=plane)
+        active_frame=self._active_geometry_calibration_frame(section)
+        active_frame_plane=(None if active_frame is None else active_frame[0])
+        px=float(workflow.period_x_px or self._geometry_period_guess_px(section,workflow.grid_x,workflow.grid_y)[0])
+        py=float(workflow.period_y_px or self._geometry_period_guess_px(section,workflow.grid_x,workflow.grid_y)[1])
+        return {
+            'plane_name':plane,
+            'calibrated':calibration is not None,
+            'calibration':calibration,
+            'grid_x':int(workflow.grid_x),'grid_y':int(workflow.grid_y),
+            'period_x_px':px,'period_y_px':py,
+            'period_x_um':self._geometry_period_to_um(section,px,'x'),
+            'period_y_um':self._geometry_period_to_um(section,py,'y'),
+            'metric_periods_available':self._geometry_period_to_um(section,px,'x') is not None and self._geometry_period_to_um(section,py,'y') is not None,
+            'computed':workflow.payload is not None,
+            'frame_active':bool(workflow.frame_active),
+            'any_frame_active':active_frame is not None,
+            'active_frame_plane':active_frame_plane,
+            'measurement':workflow.measurement,
+            'localization':workflow.localization,
+            'localization_parameters':dict(workflow.localization_parameters or {}),
+            'localization_context':({} if workflow.payload is None else dict(workflow.payload.get('localization_context') or {})),
+            'analysis':workflow.analysis,
+            'analyze_enabled':workflow.measurement is not None and workflow.localization is not None,
+            'save_enabled':workflow.analysis is not None and bool(workflow.analysis.accepted),
+            'detector_name':workflow.detector_name,
+        }
+
+    def _feedback_orientation_change_reason(self,section_key: str) -> str:
+        status = self.session.runtime.get_section_cgh_status(section_key)
+        current = status.current_round_index
+        feedback_cgh_computed = bool(
+            current is not None
+            and (int(current) > 0 or bool(status.position_active))
+        )
+        if feedback_cgh_computed:
+            return (
+                "Feedback orientation is locked after a feedback-corrected "
+                "hologram has been computed. Reset the intensity feedback to "
+                "the base round or clear the position correction before "
+                "changing orientation."
+            )
+        return ""
+
+    def feedback_orientation(self,section_key: str) -> FeedbackOrientation:
+        section = str(section_key)
+        plane = self._active_feedback_plane(section)
+        current = self._feedback_orientations.get(section)
+        if current is None or current[0] != plane:
+            orientation = self._saved_feedback_orientation(section,plane)
+            self._feedback_orientations[section] = (plane,orientation)
+            return orientation
+        return current[1]
+
+    def feedback_orientation_context(
+        self,section_key: str,
+    ) -> FeedbackOrientationContext:
+        section = str(section_key)
+        plane = self._active_feedback_plane(section)
+        orientation = self.feedback_orientation(section)
+        saved = self._saved_feedback_orientation(section,plane)
+        preferences = self.session.startup_preferences
+        plane_override = bool(
+            plane
+            and preferences is not None
+            and preferences.feedback_orientation_for_plane(section,plane) is not None
+        )
+        reason = self._feedback_orientation_change_reason(section)
+        return FeedbackOrientationContext(
+            orientation=orientation,
+            saved_orientation=saved,
+            plane_name=plane,
+            plane_override=plane_override,
+            calibrated=self.geometry_orientation_calibration(section,plane_name=plane) is not None,
+            change_allowed=not bool(reason),
+            change_unavailable_reason=reason,
+        )
+
+    def _position_reference_key(
+        self,section_key: str,
+    ) -> tuple[str,str | None]:
+        section = str(section_key)
+        return section,self._active_feedback_plane(section)
+
+    def _position_reference_change_reason(self,section_key: str) -> str:
+        status = self.session.runtime.get_section_feedback_status(section_key)
+        if bool(status.position_available):
+            return (
+                "Clear the current position correction before changing its "
+                "reference."
+            )
+        return ""
+
+    def position_reference_selection(
+        self,section_key: str,
+    ) -> PositionReferenceSelection:
+        key = self._position_reference_key(section_key)
+        selection = self._position_reference_selections.get(key)
+        if selection is None:
+            selection = PositionReferenceSelection()
+            self._position_reference_selections[key] = selection
+        if (
+            selection.mode is PositionReferenceMode.SAVED
+            and (
+                key[1] is None
+                or self._position_reference_store is None
+                or not self._position_reference_store.exists(
+                    key[1],selection.saved_name
+                )
+            )
+        ):
+            selection = PositionReferenceSelection(
+                editable_geometry=selection.editable_geometry,
+                editable_locks=selection.editable_locks,
+            )
+            self._position_reference_selections[key] = selection
+        return selection
+
+    def position_reference_context(
+        self,section_key: str,
+    ) -> PositionReferenceContext:
+        section = str(section_key)
+        plane = self._active_feedback_plane(section)
+        selection = self.position_reference_selection(section)
+        saved_names = (
+            ()
+            if plane is None or self._position_reference_store is None
+            else self._position_reference_store.list(plane)
+        )
+        compatible = True
+        compatibility_error = ""
+        inspection = self.session.runtime.get_section_feedback_inspection(section)
+        has_localization = bool(
+            inspection.measurement is not None
+            and inspection.measurement.localization is not None
+        )
+        try:
+            if has_localization:
+                self._resolve_position_reference(section)
+        except Exception as error:
+            compatible = False
+            compatibility_error = str(error)
+
+        fit_geometry = None
+        if has_localization:
+            try:
+                localization = orient_localization(
+                    inspection.measurement.localization,
+                    self.feedback_orientation(section),
+                )
+                fit_geometry = editable_position_reference_geometry(localization)
+            except Exception:
+                fit_geometry = None
+
+        change_reason = self._position_reference_change_reason(section)
+        save_reason = self._position_reference_save_reason(section)
+        return PositionReferenceContext(
+            selection=selection,
+            plane_name=plane,
+            saved_names=tuple(saved_names),
+            compatible=compatible,
+            compatibility_error=compatibility_error,
+            change_allowed=not bool(change_reason),
+            change_unavailable_reason=change_reason,
+            save_allowed=not bool(save_reason),
+            save_unavailable_reason=save_reason,
+            fit_geometry=fit_geometry,
+        )
+
+    def set_position_reference(
+        self,
+        section_key: str,
+        *,
+        mode: PositionReferenceMode | str,
+        saved_name: str | None=None,
+        editable_geometry: EditablePositionReferenceGeometry | Mapping[str,Any] | None=None,
+        editable_locks: Mapping[str,Any] | Sequence[str] | None=None,
+    ) -> PositionReferenceSelection:
+        self._require_editor_mode()
+        section = str(section_key)
+        reason = self._position_reference_change_reason(section)
+        if reason:
+            raise RuntimeError(reason)
+        normalized_mode = PositionReferenceMode.normalize(mode)
+        previous = self.position_reference_selection(section)
+        if editable_geometry is None and previous.editable_geometry is not None:
+            editable_geometry = previous.editable_geometry
+        if editable_locks is None:
+            editable_locks = previous.editable_locks
+        if normalized_mode is PositionReferenceMode.EDITABLE and editable_geometry is None:
+            inspection = self.session.runtime.get_section_feedback_inspection(section)
+            measurement = inspection.measurement
+            if measurement is None or measurement.localization is None:
+                raise RuntimeError(
+                    "Accept a localization before editing its reference lattice"
+                )
+            localization = orient_localization(
+                measurement.localization,self.feedback_orientation(section),
+            )
+            editable_geometry = editable_position_reference_geometry(localization)
+        selection = PositionReferenceSelection(
+            mode=normalized_mode,
+            saved_name=saved_name,
+            editable_geometry=editable_geometry,
+            editable_locks=_normalize_editable_locks(editable_locks),
+        )
+        plane = self._active_feedback_plane(section)
+        if selection.mode is PositionReferenceMode.SAVED:
+            if plane is None:
+                raise RuntimeError(
+                    "Select a measurement plane before using a saved position reference."
+                )
+            if self._position_reference_store is None:
+                raise RuntimeError("Position-reference storage is unavailable")
+            self._position_reference_store.load(plane,selection.saved_name)
+        self._position_reference_selections[(section,plane)] = selection
+        self._section_changed(section)
+        return selection
+
+    def fit_position_reference_center(
+        self,section_key: str,
+    ) -> PositionReferenceSelection:
+        """Replace the editable reference with a strong center-prioritized fit."""
+        self._require_editor_mode()
+        section = str(section_key)
+        reason = self._position_reference_change_reason(section)
+        if reason:
+            raise RuntimeError(reason)
+        inspection = self.session.runtime.get_section_feedback_inspection(section)
+        measurement = inspection.measurement
+        if measurement is None or measurement.localization is None:
+            raise RuntimeError(
+                "Accept a localization before fitting its reference lattice"
+            )
+        localization = orient_localization(
+            measurement.localization,self.feedback_orientation(section),
+        )
+        previous = self.position_reference_selection(section)
+        geometry = previous.editable_geometry
+        if geometry is None:
+            geometry = editable_position_reference_geometry(localization)
+        locks = previous.editable_locks
+        selection = PositionReferenceSelection(
+            mode=PositionReferenceMode.EDITABLE,
+            editable_geometry=fit_center_reference_geometry(
+                localization,geometry=geometry,
+                locks={name:(name in locks) for name in _EDITABLE_POSITION_REFERENCE_LOCK_FIELDS},
+            ),
+            editable_locks=locks,
+        )
+        plane = self._active_feedback_plane(section)
+        self._position_reference_selections[(section,plane)] = selection
+        self._section_changed(section)
+        return selection
+
+    def save_position_reference(
+        self,section_key: str,name: str,*,overwrite: bool=False,
+    ) -> PositionReference:
+        self._require_editor_mode()
+        section = str(section_key)
+        reason = self._position_reference_save_reason(section)
+        if reason:
+            raise RuntimeError(reason)
+        store = self._position_reference_store
+        if store is None:
+            raise RuntimeError("Position-reference storage is unavailable")
+        plane = self._active_feedback_plane(section)
+        if plane is None:  # guarded above; retained for static clarity.
+            raise RuntimeError("Select a measurement plane first")
+        measurement = self.session.runtime.get_section_feedback_inspection(
+            section
+        ).measurement
+        if measurement is None or measurement.localization is None:
+            raise RuntimeError("Accept a localization before saving a reference")
+        localization = orient_localization(
+            measurement.localization,self.feedback_orientation(section),
+        )
+        config_path = self.session.current_config_path
+        reference = PositionReference(
+            name=name,
+            plane_name=plane,
+            lattice_indices=localization.lattice_indices,
+            positions_px=localization_positions_full_px(localization),
+            image_shape=measurement.acquisition.image.shape,
+            detector_name=measurement.acquisition.detector,
+            metadata={
+                "source_slm_key":self.session.runtime.identity.key,
+                "source_slm_serial":self.session.runtime.identity.serial_number,
+                "source_section":section,
+                "source_target_type":localization.target_type,
+                "source_config_name":(
+                    None if not config_path else Path(config_path).name
+                ),
+                "feedback_orientation":self.feedback_orientation(section).value,
+            },
+        )
+        store.save(reference,overwrite=bool(overwrite))
+        previous = self.position_reference_selection(section)
+        self._position_reference_selections[(section,plane)] = (
+            PositionReferenceSelection(
+                mode=PositionReferenceMode.SAVED,
+                saved_name=reference.name,
+                editable_geometry=previous.editable_geometry,
+                editable_locks=previous.editable_locks,
+            )
+        )
+        self._section_changed(section)
+        return reference
+
+    def delete_position_reference(self,section_key: str,name: str) -> None:
+        self._require_editor_mode()
+        plane = self._active_feedback_plane(section_key)
+        if plane is None:
+            raise RuntimeError("Select a measurement plane first")
+        if self._position_reference_store is None:
+            raise RuntimeError("Position-reference storage is unavailable")
+        self._position_reference_store.delete(plane,str(name))
+
+    def position_reference_preview(self,section_key: str):
+        """Return detector-space reference preview plus legacy kxy diagnostics."""
+        try:
+            status = self.session.runtime.get_section_feedback_status(section_key)
+            if not status.localization_available:
+                return None
+            inspection = self.session.runtime.get_section_feedback_inspection(section_key)
+            measurement = inspection.measurement
+            if measurement is None or measurement.localization is None:
+                return None
+            localization = orient_localization(
+                measurement.localization,self.feedback_orientation(section_key),
+            )
+            reference_positions,metadata = self._resolve_position_reference(section_key)
+            reference = (
+                np.asarray(localization.expected_positions_px,dtype=np.float64)
+                if reference_positions is None
+                else np.asarray(reference_positions,dtype=np.float64)
+            )
+            analysis = self.session.runtime.compute_section_feedback_position_analysis(
+                section_key,
+                orientation=self.feedback_orientation(section_key),
+                reference_positions_px=reference_positions,
+            )
+            selection = self.position_reference_selection(section_key)
+            fit_geometry = editable_position_reference_geometry(localization)
+            editable_geometry = selection.editable_geometry
+            center = (
+                editable_reference_center_px(localization,editable_geometry)
+                if selection.mode is PositionReferenceMode.EDITABLE
+                and editable_geometry is not None
+                else np.mean(reference,axis=1)
+            )
+            return {
+                "cropped_image":np.asarray(localization.cropped_image,dtype=np.float64),
+                "measured_positions_px":np.asarray(localization.measured_positions_px,dtype=np.float64),
+                "global_positions_px":np.asarray(localization.expected_positions_px,dtype=np.float64),
+                "reference_positions_px":reference,
+                "reference_center_px":np.asarray(center,dtype=np.float64),
+                "fit_center_px":editable_reference_center_px(
+                    localization,fit_geometry,
+                ),
+                "fit_geometry":fit_geometry.to_dict(),
+                "editable_geometry":(
+                    None if editable_geometry is None else editable_geometry.to_dict()
+                ),
+                "ideal_positions_kxy":np.asarray(
+                    self.session.runtime.get_section_fov_position_context(
+                        section_key
+                    )["ideal_positions_kxy"]
+                ),
+                "baseline_positions_kxy":(
+                    np.asarray(analysis.corrected_positions_kxy)
+                    - np.asarray(analysis.correction_kxy)
+                ),
+                "displacement_kxy":np.asarray(analysis.correction_kxy),
+                "reference":metadata,
+            }
+        except Exception:
+            return None
+
+    def _resolve_position_reference(
+        self,section_key: str,
+    ) -> tuple[np.ndarray | None,dict[str,Any]]:
+        section = str(section_key)
+        inspection = self.session.runtime.get_section_feedback_inspection(section)
+        measurement = inspection.measurement
+        if measurement is None or measurement.localization is None:
+            raise RuntimeError("Accept a localization before using position feedback")
+        localization = orient_localization(
+            measurement.localization,self.feedback_orientation(section),
+        )
+        selection = self.position_reference_selection(section)
+        if selection.mode is PositionReferenceMode.GLOBAL_FIT:
+            return None,{"mode":selection.mode.value,"label":"Global fit"}
+        if selection.mode is PositionReferenceMode.EDITABLE:
+            geometry = selection.editable_geometry
+            if geometry is None:
+                geometry = editable_position_reference_geometry(localization)
+            return editable_reference_positions(localization,geometry),{
+                "mode":selection.mode.value,
+                "label":"Editable lattice",
+                "geometry":geometry.to_dict(),
+            }
+
+        plane = self._active_feedback_plane(section)
+        if plane is None:
+            raise RuntimeError(
+                "Saved position references require an active measurement plane"
+            )
+        if self._position_reference_store is None:
+            raise RuntimeError("Position-reference storage is unavailable")
+        reference = self._position_reference_store.load(
+            plane,selection.saved_name,
+        )
+        if tuple(reference.image_shape) != tuple(measurement.acquisition.image.shape):
+            raise RuntimeError(
+                "Saved reference image shape %s does not match current measurement %s"
+                % (reference.image_shape,measurement.acquisition.image.shape)
+            )
+        current_detector = str(measurement.acquisition.detector or "").strip() or None
+        if (
+            reference.detector_name is not None
+            and current_detector is not None
+            and reference.detector_name != current_detector
+        ):
+            raise RuntimeError(
+                'Saved reference detector "%s" does not match current detector "%s"'
+                % (reference.detector_name,current_detector)
+            )
+        positions = reference_positions_for_localization(reference,localization)
+        return positions,{
+            "mode":selection.mode.value,
+            "label":"Saved: %s" % reference.name,
+            "name":reference.name,
+            "plane_name":reference.plane_name,
+            "created_at":reference.created_at,
+        }
+
+    def _position_reference_save_reason(self,section_key: str) -> str:
+        status = self.session.runtime.get_section_feedback_status(section_key)
+        if FeedbackCapability.POSITION_CORRECTION not in set(status.capabilities):
+            return "Position references are unavailable for this target."
+        change_reason = self._position_reference_change_reason(section_key)
+        if change_reason:
+            return change_reason
+        if self._position_reference_store is None:
+            return "Position-reference storage is unavailable."
+        if self._active_feedback_plane(section_key) is None:
+            return "Select a measurement plane before saving a position reference."
+        inspection = self.session.runtime.get_section_feedback_inspection(section_key)
+        measurement = inspection.measurement
+        if measurement is None or measurement.localization is None:
+            return "Accept a localization before saving a position reference."
+        if not _localization_is_complete(measurement.localization):
+            return "Only a complete, genuinely localized target can be saved as a reference."
+        return ""
+
+    def _on_position_reference_store_changed(self) -> None:
+        runtime = self.session.runtime
+        for section in tuple(runtime.section_keys):
+            key = self._position_reference_key(section)
+            selection = self._position_reference_selections.get(key)
+            if selection is not None and selection.mode is PositionReferenceMode.SAVED:
+                plane = key[1]
+                if (
+                    plane is None
+                    or self._position_reference_store is None
+                    or not self._position_reference_store.exists(
+                        plane,selection.saved_name
+                    )
+                ):
+                    self._position_reference_selections[key] = PositionReferenceSelection()
+            self._section_changed(section)
+
+    def _fov_position_key(self,section_key: str) -> tuple[str,str | None]:
+        section = str(section_key)
+        return section,self._active_feedback_plane(section)
+
+    def _saved_fov_position_calibration_name(
+        self,section_key: str,plane_name: str | None,
+    ) -> str | None:
+        preferences = self.session.startup_preferences
+        if preferences is None:
+            return None
+        return preferences.default_fov_position_calibration(
+            section_key,plane_name,
+        )
+
+    def _load_fov_position_calibration(
+        self,section_key: str,plane_name: str,name: str,
+    ) -> FOVPositionCalibration:
+        store = self._fov_position_calibration_store
+        if store is None:
+            raise RuntimeError("FOV position-calibration storage is unavailable")
+        return store.load(
+            self.session.runtime.identity,section_key,plane_name,name,
+        )
+
+    def fov_position_calibration_context(self,section_key: str) -> dict[str,Any]:
+        section = str(section_key)
+        plane = self._active_feedback_plane(section)
+        key = (section,plane)
+        store = self._fov_position_calibration_store
+        names = (
+            () if plane is None or store is None else
+            store.list(self.session.runtime.identity,section,plane)
+        )
+        selection = self._fov_position_calibration_selections.get(key)
+        if selection is None:
+            default_name = self._saved_fov_position_calibration_name(section,plane)
+            selected = default_name if default_name in names else None
+            selection = {"selected_name":selected,"applied":bool(selected)}
+            self._fov_position_calibration_selections[key] = selection
+        selected = str(selection.get("selected_name") or "").strip() or None
+        if selected not in names:
+            selected = None
+            selection["selected_name"] = None
+            selection["applied"] = False
+        applied = bool(selection.get("applied",False) and selected)
+        runtime_context = self.session.runtime.get_section_fov_position_context(section)
+        outside = np.asarray(runtime_context.get("outside_mask",()),dtype=bool)
+        extrapolated_count = int(np.count_nonzero(outside)) if applied else 0
+        calibration = (
+            None if selected is None or plane is None or store is None
+            else self._load_fov_position_calibration(section,plane,selected)
+        )
+        candidate = self._fov_position_calibration_candidates.get(key)
+        return {
+            "plane_name":plane,
+            "available_names":tuple(names),
+            "selected_name":selected,
+            "applied":applied,
+            "default_name":self._saved_fov_position_calibration_name(section,plane),
+            "supported":bool(runtime_context.get("supported",False)),
+            "calibration":calibration,
+            "candidate":candidate,
+            "extrapolated_count":extrapolated_count,
+            "target_count":int(np.asarray(runtime_context["ideal_positions_kxy"]).shape[1]),
+            "max_extrapolation_kxy":float(runtime_context.get("max_extrapolation_kxy",0.0)),
+            "coverage_tolerance_kxy":float(runtime_context.get("coverage_tolerance_kxy",0.0)),
+        }
+
+    def fov_position_calibration_preview(self,section_key: str) -> dict[str,Any] | None:
+        context = self.fov_position_calibration_context(section_key)
+        key = self._fov_position_key(section_key)
+        candidate = self._fov_position_calibration_candidates.get(key)
+        calibration = candidate if candidate is not None else context.get("calibration")
+        if calibration is None:
+            return None
+        current = self.session.runtime.get_section_fov_position_context(section_key)
+        ideal = np.asarray(current["ideal_positions_kxy"],dtype=np.float64)
+        # Inspect the field at the current target when it is meaningful.  With
+        # no target (or an incompatible target), fall back to the calibration's
+        # own sample positions so the read-only FOV view remains usable.
+        if bool(current.get("supported",False)) and ideal.shape[1] > 0:
+            preview_positions = ideal
+        else:
+            preview_positions = np.asarray(
+                calibration.sample_positions_kxy,dtype=np.float64,
+            )
+        predicted = calibration.evaluate(preview_positions)
+        return {
+            "source":"candidate" if candidate is not None else "applied",
+            "name":None if candidate is not None else calibration.name,
+            "model":calibration.model,
+            "degree":calibration.degree,
+            "sample_count":calibration.sample_count,
+            "rms_residual_kxy":calibration.rms_residual_kxy,
+            "max_residual_kxy":calibration.max_residual_kxy,
+            "sample_positions_kxy":np.asarray(calibration.sample_positions_kxy),
+            "sample_displacements_kxy":np.asarray(calibration.sample_displacements_kxy),
+            "current_positions_kxy":preview_positions,
+            "current_displacements_kxy":predicted,
+        }
+
+    def select_fov_position_calibration(
+        self,section_key: str,name: str | None,
+    ) -> None:
+        self._require_editor_mode()
+        section = str(section_key)
+        plane = self._active_feedback_plane(section)
+        if plane is None:
+            raise RuntimeError("Select a measurement plane before choosing an FOV calibration")
+        key = (section,plane)
+        selected = str(name or "").strip() or None
+        selection = self._fov_position_calibration_selections.setdefault(
+            key,{"selected_name":None,"applied":False},
+        )
+        calibration = None
+        if selected is not None:
+            calibration = self._load_fov_position_calibration(section,plane,selected)
+        selection["selected_name"] = selected
+        if bool(selection.get("applied",False)):
+            if calibration is None:
+                selection["applied"] = False
+            self._set_runtime_fov_position_calibration(section,calibration)
+            self._warn_fov_extrapolation(section)
+        self._section_changed(section)
+
+    def set_fov_position_calibration_applied(
+        self,section_key: str,applied: bool,
+    ) -> None:
+        self._require_editor_mode()
+        section = str(section_key)
+        plane = self._active_feedback_plane(section)
+        if plane is None:
+            raise RuntimeError("Select a measurement plane before applying an FOV calibration")
+        key = (section,plane)
+        selection = self._fov_position_calibration_selections.setdefault(
+            key,{"selected_name":None,"applied":False},
+        )
+        name = str(selection.get("selected_name") or "").strip() or None
+        applied = bool(applied)
+        if applied and name is None:
+            raise RuntimeError("Choose an FOV calibration before enabling Apply")
+        calibration = (
+            self._load_fov_position_calibration(section,plane,name)
+            if applied else None
+        )
+        selection["applied"] = applied
+        self._set_runtime_fov_position_calibration(section,calibration)
+        self._section_changed(section)
+        self._warn_fov_extrapolation(section)
+
+    def set_default_fov_position_calibration(self,section_key: str) -> None:
+        self._require_editor_mode()
+        section = str(section_key)
+        plane = self._active_feedback_plane(section)
+        if plane is None:
+            raise RuntimeError("Select a measurement plane before setting an FOV default")
+        context = self.fov_position_calibration_context(section)
+        name = context.get("selected_name")
+        if not name:
+            raise RuntimeError("Choose an FOV calibration before setting the default")
+        preferences = self.session.startup_preferences
+        if preferences is None:
+            raise RuntimeError("Startup preferences are unavailable")
+        preferences.set_default_fov_position_calibration(section,plane,name)
+        self.set_fov_position_calibration_applied(section,True)
+
+    def delete_fov_position_calibration(self,section_key: str) -> str:
+        self._require_editor_mode()
+        section = str(section_key)
+        context = self.fov_position_calibration_context(section)
+        plane = context.get("plane_name")
+        name = context.get("selected_name")
+        if not plane or not name:
+            raise RuntimeError("Choose an FOV calibration before deleting it")
+        store = self._fov_position_calibration_store
+        if store is None:
+            raise RuntimeError("FOV position-calibration storage is unavailable")
+
+        # Delete first so a filesystem failure leaves both selection and
+        # startup default untouched.  The synchronous store listener clears
+        # the selected/applied runtime calibration.
+        store.delete(self.session.runtime.identity,section,plane,name)
+        preferences = self.session.startup_preferences
+        if (
+            preferences is not None
+            and preferences.default_fov_position_calibration(section,plane) == name
+        ):
+            preferences.set_default_fov_position_calibration(section,plane,None)
+        self._fov_position_calibration_candidates.pop((section,plane),None)
+        self._section_changed(section)
+        return str(name)
+
+    def fit_fov_position_calibration(
+        self,section_key: str,*,model: str="polynomial",degree: int=2,
+    ) -> FOVPositionCalibration:
+        self._require_editor_mode()
+        section = str(section_key)
+        plane = self._active_feedback_plane(section)
+        if plane is None:
+            raise RuntimeError("Select a measurement plane before fitting an FOV calibration")
+        status = self.session.runtime.get_section_feedback_status(section)
+        if FeedbackCapability.POSITION_CORRECTION not in set(status.capabilities):
+            raise RuntimeError("The current target does not support position correction")
+
+        # Prefer the accepted transient correction.  It remains authoritative
+        # after computing an adapted hologram, which lets users verify the
+        # correction experimentally and only then promote it to a persistent
+        # FOV calibration.  Fall back to a fresh analysis only before a
+        # correction has been accepted.
+        session_inspection = self.session.runtime.get_section_cgh_session_inspection(
+            section
+        )
+        correction = session_inspection.position_correction
+        if correction is not None:
+            ideal = np.asarray(
+                correction.ideal_positions_kxy,dtype=np.float64,
+            )
+            total_displacement = (
+                np.asarray(correction.corrected_positions_kxy,dtype=np.float64)
+                - ideal
+            )
+            reference_metadata = dict(correction.reference or {})
+            detector = correction.measurement.acquisition.detector
+            source = "accepted_position_correction"
+        else:
+            reference_positions,reference_metadata = self._resolve_position_reference(
+                section
+            )
+            analysis = self.session.runtime.compute_section_feedback_position_analysis(
+                section,
+                orientation=self.feedback_orientation(section),
+                reference_positions_px=reference_positions,
+            )
+            current = self.session.runtime.get_section_fov_position_context(section)
+            ideal = np.asarray(current["ideal_positions_kxy"],dtype=np.float64)
+            total_displacement = (
+                np.asarray(analysis.corrected_positions_kxy,dtype=np.float64)-ideal
+            )
+            inspection = self.session.runtime.get_section_feedback_inspection(section)
+            detector = None
+            if inspection.measurement is not None:
+                detector = inspection.measurement.acquisition.detector
+            source = "current_position_analysis"
+
+        calibration = FOVPositionCalibration.fit(
+            name="Current candidate",
+            slm_serial=self.session.runtime.identity.serial_number,
+            section_key=section,plane_name=plane,
+            ideal_positions_kxy=ideal,
+            total_displacements_kxy=total_displacement,
+            model=model,degree=degree,detector_name=detector,
+            provenance={
+                "reference":dict(reference_metadata or {}),
+                "source":source,
+                "source_applied_calibration":self.fov_position_calibration_context(
+                    section
+                ).get("selected_name"),
+            },
+        )
+        self._fov_position_calibration_candidates[(section,plane)] = calibration
+        self._section_changed(section)
+        return calibration
+
+    def save_fov_position_calibration(
+        self,section_key: str,name: str,*,overwrite: bool=False,
+    ) -> FOVPositionCalibration:
+        self._require_editor_mode()
+        section = str(section_key)
+        plane = self._active_feedback_plane(section)
+        if plane is None:
+            raise RuntimeError("Select a measurement plane before saving an FOV calibration")
+        candidate = self._fov_position_calibration_candidates.get((section,plane))
+        if candidate is None:
+            raise RuntimeError("Build an FOV calibration fit before saving")
+        saved = candidate.with_name(str(name))
+        store = self._fov_position_calibration_store
+        if store is None:
+            raise RuntimeError("FOV position-calibration storage is unavailable")
+        store.save(saved,overwrite=overwrite)
+        self._section_changed(section)
+        return saved
+
+    def fov_position_calibration_replacement_warning(
+        self,section_key: str,
+    ) -> str:
+        section = str(section_key)
+        context = self.fov_position_calibration_context(section)
+        plane = context.get("plane_name")
+        name = context.get("selected_name")
+        if not plane or not name or not context.get("applied"):
+            return ""
+        candidate = self._fov_position_calibration_candidates.get((section,plane))
+        if candidate is None:
+            return ""
+        old = self._load_fov_position_calibration(section,plane,name)
+        old_area = float(old.coverage_area)
+        new_area = float(candidate.coverage_area)
+        if old_area <= 0 or new_area <= 0:
+            return (
+                "Candidate and applied FOV calibration coverage could not be "
+                "compared reliably because one convex hull is degenerate."
+            ) if old_area != new_area else ""
+
+        old_outside_new,_,_ = candidate.coverage_extrapolation(
+            old.sample_positions_kxy
+        )
+        new_outside_old,_,_ = old.coverage_extrapolation(
+            candidate.sample_positions_kxy
+        )
+        lost = int(np.count_nonzero(old_outside_new))
+        added = int(np.count_nonzero(new_outside_old))
+        area_ratio = new_area/old_area
+        area_changed = area_ratio < 0.98 or area_ratio > 1.02
+        if lost or added or area_changed:
+            details = [
+                "candidate area %.1f%% of the previous convex-hull area"
+                % (100.0*area_ratio)
+            ]
+            if lost:
+                details.append(
+                    "%d/%d previous samples lie outside the candidate coverage"
+                    % (lost,old.sample_count)
+                )
+            if added:
+                details.append(
+                    "%d/%d candidate samples lie outside the previous coverage"
+                    % (added,candidate.sample_count)
+                )
+            return "Candidate measured coverage differs from the applied calibration (" + "; ".join(details) + ")."
+        return ""
+
+    def replace_applied_fov_position_calibration(self,section_key: str) -> str:
+        self._require_editor_mode()
+        section = str(section_key)
+        context = self.fov_position_calibration_context(section)
+        plane = context.get("plane_name")
+        name = context.get("selected_name")
+        if not plane or not name or not context.get("applied"):
+            raise RuntimeError("An applied FOV calibration is required for replacement")
+        candidate = self._fov_position_calibration_candidates.get((section,plane))
+        if candidate is None:
+            raise RuntimeError("Build a candidate FOV fit before replacing the applied calibration")
+        saved = candidate.with_name(name)
+        self._fov_position_calibration_store.save(saved,overwrite=True)
+        self._fov_position_calibration_candidates.pop((section,plane),None)
+        self._set_runtime_fov_position_calibration(section,saved)
+        self._section_changed(section)
+        self._warn_fov_extrapolation(section)
+        return name
+
+    def _set_runtime_fov_position_calibration(
+        self,section_key: str,calibration: FOVPositionCalibration | None,
+        *,notify: bool=True,
+    ) -> None:
+        # Context refreshes happen for all sections on plane/catalog changes.
+        # Do not cancel a CGH request or create redundant callbacks when this
+        # section already holds the exact same persistent field.
+        current = None
+        current_known = False
+        try:
+            current = self.session.runtime.get_section_fov_position_context(
+                section_key
+            ).get("calibration")
+            current_known = True
+        except Exception:
+            # If the current target is temporarily invalid, fall back to the
+            # conservative path below; the runtime setter remains authoritative.
+            pass
+        same = (
+            current is calibration
+            or (
+                current_known
+                and current is not None
+                and calibration is not None
+                and current.to_dict() == calibration.to_dict()
+            )
+            or (current_known and current is None and calibration is None)
+        )
+        if same:
+            if notify:
+                self._section_changed(section_key)
+            return
+
+        self.session.cancel_cgh(section_key)
+        transition = self.session.runtime.set_section_fov_position_calibration(
+            section_key,calibration,
+        )
+        if notify:
+            if transition is not None:
+                self._callbacks.on_transition_committed(section_key,transition)
+            else:
+                self._section_changed(section_key)
+
+    def _warn_fov_extrapolation(self,section_key: str) -> None:
+        context = self.fov_position_calibration_context(section_key)
+        count = int(context.get("extrapolated_count",0) or 0)
+        if count:
+            self._warning(
+                "FOV calibration extrapolation",
+                "%d of %d current target positions lie outside the measured FOV "
+                "coverage (beyond numerical tolerance). The polynomial calibration "
+                "will be extrapolated at those positions."
+                % (count,int(context.get("target_count",0) or 0)),
+            )
+
+    def apply_startup_fov_position_calibration_defaults(self) -> None:
+        self.refresh_fov_position_calibration_contexts()
+
+    def refresh_fov_position_calibration_contexts(self) -> None:
+        runtime = self.session.runtime
+        active_keys = set()
+        for section_key in tuple(runtime.section_keys):
+            section = str(section_key)
+            plane = self._active_feedback_plane(section)
+            key = (section,plane)
+            active_keys.add(key)
+            selection = self._fov_position_calibration_selections.get(key)
+            if selection is None:
+                name = self._saved_fov_position_calibration_name(section,plane)
+                valid_default = bool(
+                    name and plane and self._fov_position_calibration_store is not None
+                    and self._fov_position_calibration_store.exists(
+                        runtime.identity,section,plane,name
+                    )
+                )
+                selection = {
+                    "selected_name":name if valid_default else None,
+                    "applied":valid_default,
+                }
+                self._fov_position_calibration_selections[key] = selection
+            name = str(selection.get("selected_name") or "").strip() or None
+            applied = bool(selection.get("applied",False) and name and plane)
+            calibration = (
+                self._load_fov_position_calibration(section,plane,name)
+                if applied else None
+            )
+            self._set_runtime_fov_position_calibration(
+                section,calibration,notify=True,
+            )
+        for key in tuple(self._fov_position_calibration_candidates):
+            if key not in active_keys and key[0] not in runtime.section_keys:
+                self._fov_position_calibration_candidates.pop(key,None)
+
+    def _on_fov_position_calibration_store_changed(self) -> None:
+        runtime = self.session.runtime
+        for section_key in tuple(runtime.section_keys):
+            section = str(section_key)
+            plane = self._active_feedback_plane(section)
+            if plane is None:
+                continue
+            key = (section,plane)
+            selection = self._fov_position_calibration_selections.get(key)
+            if selection is None:
+                continue
+            name = str(selection.get("selected_name") or "").strip() or None
+            exists = bool(
+                name and self._fov_position_calibration_store.exists(
+                    runtime.identity,section,plane,name
+                )
+            )
+            if not exists:
+                selection["selected_name"] = None
+                selection["applied"] = False
+                self._set_runtime_fov_position_calibration(section,None,notify=True)
+            elif selection.get("applied"):
+                calibration = self._load_fov_position_calibration(section,plane,name)
+                self._set_runtime_fov_position_calibration(section,calibration,notify=True)
+            else:
+                self._section_changed(section)
+
+    def compute_geometry_orientation_calibration_target(
+        self,section_key: str,*,grid_x: int,grid_y: int,period_x_px: float,period_y_px: float,
+        source: str,on_complete: Callable[[bool,Exception | None],None] | None=None,
+    ) -> bool:
+        self._require_editor_mode()
+        section=str(section_key); plane=self._active_feedback_plane(section)
+        if plane is None:
+            raise RuntimeError('Select a measurement plane before geometry calibration.')
+        key=(section,plane)
+        workflow=self._geometry_calibration_workflows.setdefault(key,_GeometryCalibrationWorkflow())
+        pending_grid_x=int(grid_x); pending_grid_y=int(grid_y)
+        pending_period_x=float(period_x_px); pending_period_y=float(period_y_px)
+        pending_detector=str(source or '').strip() or None
+
+        def finished(success,error,payload):
+            if not success or payload is None:
+                if on_complete is not None:on_complete(False,error or RuntimeError('Geometry calibration CGH failed'))
+                return
+            candidate_payload=dict(payload)
+            if not self.session.upload_frame(candidate_payload['frame']):
+                if on_complete is not None:
+                    on_complete(False,RuntimeError('Could not upload the geometry calibration frame.'))
+                return
+            for (workflow_section,_workflow_plane),other in self._geometry_calibration_workflows.items():
+                if workflow_section == section:
+                    other.frame_active=False
+            workflow.grid_x=pending_grid_x; workflow.grid_y=pending_grid_y
+            workflow.period_x_px=pending_period_x; workflow.period_y_px=pending_period_y
+            workflow.payload=candidate_payload
+            workflow.measurement=None; workflow.localization=None
+            workflow.localization_parameters=None; workflow.analysis=None
+            workflow.detector_name=pending_detector
+            workflow.frame_active=True
+            self._section_changed(section)
+            if on_complete is not None:on_complete(True,None)
+
+        return self.session.compute_geometry_orientation_cgh(
+            section,grid_x=int(grid_x),grid_y=int(grid_y),
+            period_x_px=float(period_x_px),period_y_px=float(period_y_px),
+            on_finished=finished,
+        )
+
+    def acquire_geometry_orientation_calibration(
+        self,section_key: str,source: str,*,on_complete: Callable[[bool,Exception | None],None] | None=None,
+    ) -> None:
+        self._require_editor_mode()
+        section=str(section_key); key=self._geometry_calibration_key(section)
+        workflow=self._geometry_calibration_workflows.get(key)
+        if workflow is None or workflow.payload is None:
+            raise RuntimeError('Compute the geometry calibration target before acquiring.')
+        if not workflow.frame_active:
+            raise RuntimeError(
+                'The geometry calibration target is not currently displayed. '
+                'Compute the calibration target again before acquiring.'
+            )
+        source=str(source or '').strip()
+        if not source:raise ValueError('Select a detector before acquisition.')
+        workflow.detector_name=source
+
+        def result(measurement):
+            workflow.measurement=measurement
+            workflow.localization=None; workflow.localization_parameters=None
+            workflow.analysis=None
+            workflow.detector_name=(
+                str(getattr(measurement,"detector",None) or source).strip() or None
+            )
+            self._section_changed(section)
+            if on_complete is not None:on_complete(True,None)
+
+        def error(error):
+            self._section_changed(section)
+            if on_complete is not None:on_complete(False,error)
+
+        self.request_measurement(
+            section,source,
+            metadata={**self.feedback_measurement_metadata(section),'workflow':'geometry_orientation_calibration'},
+            on_result=result,on_error=error,
+        )
+
+    def set_geometry_orientation_calibration_measurement(
+        self,section_key: str,measurement: ImageMeasurement,
+    ) -> None:
+        self._require_editor_mode(); section=str(section_key)
+        workflow=self._geometry_calibration_workflows.get(self._geometry_calibration_key(section))
+        if workflow is None or workflow.payload is None:
+            raise RuntimeError('Compute the geometry calibration target before loading a measurement.')
+        workflow.measurement=measurement
+        workflow.localization=None; workflow.localization_parameters=None
+        workflow.analysis=None
+        self._section_changed(section)
+
+    def _localize_geometry_orientation_workflow(
+        self,section_key: str,workflow: _GeometryCalibrationWorkflow,parameters: Mapping[str,Any] | None,
+    ):
+        if workflow.payload is None or workflow.measurement is None:
+            raise RuntimeError('Geometry calibration needs a computed target and measurement.')
+        payload=workflow.payload
+        if parameters is None:
+            parameters=dict(
+                self.session.runtime.get_section_feedback_status(
+                    section_key
+                ).localization_params
+            )
+            parameters.update(suggest_localization_sources(
+                workflow.measurement,payload.get('localization_context') or {},allow_target_hints=True,
+            ))
+        candidate=localize_measurement(
+            workflow.measurement,target_type=str(payload['target_type']),
+            target_params=dict(payload['target_params']),resolution=payload['resolution'],
+            parameters=dict(parameters),calibration=payload.get('calibration'),
+        )
+        workflow.localization=candidate
+        workflow.localization_parameters=dict(parameters)
+        workflow.analysis=None
+        return candidate
+
+    def geometry_orientation_localization_candidate(
+        self,section_key: str,parameters: Mapping[str,Any],
+    ):
+        self._require_editor_mode(); section=str(section_key)
+        workflow=self._geometry_calibration_workflows.get(self._geometry_calibration_key(section))
+        if workflow is None:raise RuntimeError('Start geometry calibration first.')
+        candidate=self._localize_geometry_orientation_workflow(section,workflow,parameters)
+        self._section_changed(section)
+        return candidate
+
+    def analyze_geometry_orientation_calibration(self,section_key: str) -> GeometryOrientationAnalysis:
+        self._require_editor_mode(); section=str(section_key)
+        workflow=self._geometry_calibration_workflows.get(self._geometry_calibration_key(section))
+        if workflow is None or workflow.payload is None or workflow.measurement is None or workflow.localization is None:
+            raise RuntimeError('Acquire/load and localize the geometry calibration target first.')
+        analysis=analyze_geometry_orientation(
+            workflow.measurement,workflow.localization,
+            np.asarray(workflow.payload['target_intensities'],dtype=np.float64),
+        )
+        workflow.analysis=analysis
+        self._section_changed(section)
+        return analysis
+
+    def save_geometry_orientation_calibration(self,section_key: str) -> GeometryOrientationCalibration:
+        self._require_editor_mode(); section=str(section_key); plane=self._active_feedback_plane(section)
+        if plane is None:raise RuntimeError('Select a measurement plane first.')
+        workflow=self._geometry_calibration_workflows.get((section,plane))
+        if workflow is None or workflow.analysis is None or not workflow.analysis.accepted:
+            raise RuntimeError('Analyze a confident geometry calibration before saving.')
+        store=self._geometry_orientation_calibration_store
+        if store is None:raise RuntimeError('Geometry orientation-calibration storage is unavailable.')
+        calibration=GeometryOrientationCalibration(
+            slm_serial=self.session.runtime.identity.serial_number,section_key=section,plane_name=plane,
+            orientation=workflow.analysis.orientation,detector_name=workflow.detector_name,
+            grid_x=workflow.grid_x,grid_y=workflow.grid_y,
+            period_x_px=float(workflow.period_x_px),period_y_px=float(workflow.period_y_px),
+            score=workflow.analysis.score,confidence_margin=workflow.analysis.confidence_margin,
+            matched_count=workflow.analysis.matched_count,
+            provenance={'measurement_id':getattr(workflow.measurement,'measurement_id',None)},
+        )
+        store.save(calibration)
+        self._feedback_orientations[section]=(plane,calibration.orientation)
+        if self.session.runtime.get_section_feedback_status(section).localization_available:
+            self._update_committed_analysis(section)
+        self._section_changed(section)
+        return calibration
+
+    def finish_geometry_orientation_calibration(self,section_key: str) -> None:
+        """Restore the authoritative experiment frame after manual calibration."""
+        self._require_editor_mode()
+        section=str(section_key)
+        active=self._active_geometry_calibration_frame(section)
+        if active is None:
+            return
+        _plane,workflow=active
+        if not self.session.upload_current_frame():
+            raise RuntimeError('Could not restore the current experiment CGH.')
+        workflow.frame_active=False
+        self._section_changed(section)
+
+    def _on_geometry_orientation_calibration_store_changed(self) -> None:
+        self.refresh_feedback_orientation_contexts(force=True)
+
+    def set_feedback_orientation(
+        self,section_key: str,orientation: FeedbackOrientation | str,
+    ) -> FeedbackOrientation:
+        self._require_editor_mode()
+        section = str(section_key)
+        reason = self._feedback_orientation_change_reason(section)
+        if reason:
+            raise RuntimeError(reason)
+        normalized = FeedbackOrientation.normalize(orientation)
+        plane = self._active_feedback_plane(section)
+        self._feedback_orientations[section] = (plane,normalized)
+        if self.session.runtime.get_section_feedback_status(
+            section
+        ).localization_available:
+            self._update_committed_analysis(section)
+        self._section_changed(section)
+        return normalized
+
+    def save_feedback_orientation(self,section_key: str) -> FeedbackOrientation:
+        """Persist the current transient orientation for the active plane/default."""
+        self._require_editor_mode()
+        section = str(section_key)
+        orientation = self.feedback_orientation(section)
+        plane = self._active_feedback_plane(section)
+        preferences = self.session.startup_preferences
+        if preferences is None:
+            raise RuntimeError("Startup preferences are unavailable")
+        if plane is None:
+            preferences.set_feedback_orientation_default(section,orientation.value)
+        else:
+            preferences.set_feedback_orientation_for_plane(
+                section,plane,orientation.value,
+            )
+        self._section_changed(section)
+        return orientation
+
+    def refresh_feedback_orientation_contexts(self,*,force: bool=False) -> None:
+        """Refresh orientation after plane changes or authoritative calibration changes."""
+        for section_key in tuple(self.session.runtime.section_keys):
+            section = str(section_key)
+            current = self._feedback_orientations.get(section)
+            if current is None:
+                continue
+            plane = self._active_feedback_plane(section)
+            if current[0] == plane and not force:
+                continue
+            orientation = self._saved_feedback_orientation(section,plane)
+            self._feedback_orientations[section] = (plane,orientation)
+            if self.session.runtime.get_section_feedback_status(
+                section
+            ).localization_available:
+                self._update_committed_analysis(section)
+            self._section_changed(section)
 
     def request_measurement(
         self,
@@ -566,7 +1989,25 @@ class SLMFeedbackService:
         metrics = None
         try:
             metrics = runtime.compute_section_feedback_intensity_analysis(
-                section_key,candidate,
+                section_key,candidate,orientation=self.feedback_orientation(section_key),
+            )
+        except Exception as error:
+            self._warning(
+                "Measurement metrics",
+                "Measurement metrics are unavailable: %s" % error,
+            )
+        return candidate,metrics
+
+    def infer_missing_localization_candidate(
+        self,section_key: str,localization: Any,
+    ):
+        """Return a candidate with unresolved lattice sites explicitly inferred."""
+        self._require_editor_mode()
+        candidate = infer_missing_localization(localization)
+        metrics = None
+        try:
+            metrics = self.session.runtime.compute_section_feedback_intensity_analysis(
+                section_key,candidate,orientation=self.feedback_orientation(section_key),
             )
         except Exception as error:
             self._warning(
@@ -591,6 +2032,16 @@ class SLMFeedbackService:
             runtime.commit_section_feedback_localization(
                 section_key,localization,parameters,
             )
+            key = self._position_reference_key(section_key)
+            selection = self._position_reference_selections.get(key)
+            if selection is not None and selection.mode is PositionReferenceMode.EDITABLE:
+                oriented = orient_localization(
+                    localization,self.feedback_orientation(section_key),
+                )
+                self._position_reference_selections[key] = PositionReferenceSelection(
+                    mode=PositionReferenceMode.EDITABLE,
+                    editable_geometry=editable_position_reference_geometry(oriented),
+                )
             self._update_committed_analysis(section_key,localization)
             self._section_changed(section_key)
             return True
@@ -645,6 +2096,7 @@ class SLMFeedbackService:
                 try:
                     candidate_analysis = runtime.compute_section_feedback_intensity_analysis(
                         section_key,localization,
+                        orientation=self.feedback_orientation(section_key),
                     )
                 except Exception as error:
                     self._warning(
@@ -680,10 +2132,16 @@ class SLMFeedbackService:
     def apply_position_correction(
         self,section_key: str,*,reset_intensity: bool=False,
     ):
+        reference_positions,reference_metadata = self._resolve_position_reference(
+            section_key
+        )
         return self._apply_resolution_operation(
             section_key,
             lambda runtime:runtime.apply_section_position_correction(
                 section_key,reset_intensity=bool(reset_intensity),
+                orientation=self.feedback_orientation(section_key),
+                reference_positions_px=reference_positions,
+                reference_metadata=reference_metadata,
             ),
             "Applying position correction failed",
         )
@@ -826,9 +2284,26 @@ class SLMFeedbackService:
         self._automatic.cancel_for_runtime_change()
         for section_key in tuple(self._measurement_requests):
             self.cancel_measurement(section_key)
+        self._feedback_orientations.clear()
 
     def dispose(self) -> None:
         self.prepare_runtime_change()
+        if self._position_reference_store is not None:
+            self._position_reference_store.remove_listener(
+                self._on_position_reference_store_changed
+            )
+        if self._fov_position_calibration_store is not None:
+            self._fov_position_calibration_store.remove_listener(
+                self._on_fov_position_calibration_store_changed
+            )
+        if self._geometry_orientation_calibration_store is not None:
+            self._geometry_orientation_calibration_store.remove_listener(
+                self._on_geometry_orientation_calibration_store_changed
+            )
+        self._position_reference_selections.clear()
+        self._fov_position_calibration_selections.clear()
+        self._fov_position_calibration_candidates.clear()
+        self._geometry_calibration_workflows.clear()
 
     def _update_committed_analysis(
         self,section_key: str,localization: Any=None,
@@ -837,6 +2312,7 @@ class SLMFeedbackService:
             runtime = self.session.runtime
             analysis = runtime.compute_section_feedback_intensity_analysis(
                 section_key,localization,
+                orientation=self.feedback_orientation(section_key),
             )
             runtime.set_section_feedback_intensity_analysis(section_key,analysis)
         except Exception as error:
@@ -888,3 +2364,14 @@ class SLMFeedbackService:
     def _require_editor_mode(self) -> None:
         if not self.session.editor_writes_allowed:
             raise RuntimeError("Operation unavailable in Fast Config mode")
+
+
+def _localization_is_complete(localization: Any) -> bool:
+    count = int(localization.lattice_indices.shape[1])
+    matched_value = dict(getattr(localization,"diagnostics",{}) or {}).get(
+        "matched_mask"
+    )
+    if matched_value is None:
+        return True
+    matched = np.asarray(matched_value,dtype=bool)
+    return matched.shape == (count,) and bool(np.all(matched))

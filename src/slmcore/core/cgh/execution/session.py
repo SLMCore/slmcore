@@ -15,9 +15,12 @@ from ..feedback import (
     FeedbackInspection,
     FeedbackMeasurement,
     FeedbackStatus,
+    FeedbackOrientation,
     IntensityAdaptation,
     PositionCorrection,
+    FOVPositionCalibration,
     RoundEvaluation,
+    orient_localization,
 )
 from ..feedback.analysis import analyze_position
 from ..feedback.parameters import POSITION_CORRECTION_PARAMS
@@ -57,6 +60,7 @@ from ..signature import (
     compute_context_signature,
     compute_feedback_target_signature,
     compute_position_correction_signature,
+    compute_position_layers_signature,
 )
 from .spec import CGHSpec
 from .status import CGHResultState,CGHStatus
@@ -83,6 +87,7 @@ class CGHSession:
         self._position_params = _default_values(POSITION_CORRECTION_PARAMS)
         self._localization_reference = None
         self._position_correction: PositionCorrection | None = None
+        self._fov_position_calibration: FOVPositionCalibration | None = None
         self._position_reference_round: CGHRound | None = None
         self._position_active = False
         self._prefer_previous_initialization = False
@@ -95,6 +100,10 @@ class CGHSession:
     @property
     def target(self) -> Target | None:
         return self._target.clone() if self._target is not None else None
+
+    @property
+    def fov_position_calibration(self) -> FOVPositionCalibration | None:
+        return self._fov_position_calibration
 
     @property
     def session_snapshot(self) -> CGHSessionSnapshot | None:
@@ -129,6 +138,7 @@ class CGHSession:
         candidate._position_params = dict(self._position_params)
         candidate._localization_reference = self._localization_reference
         candidate._position_correction = self._position_correction
+        candidate._fov_position_calibration = self._fov_position_calibration
         candidate._position_reference_round = self._position_reference_round
         candidate._position_active = self._position_active
         candidate._prefer_previous_initialization = self._prefer_previous_initialization
@@ -191,6 +201,33 @@ class CGHSession:
             CGHPreparedPurpose.TARGET_REPLACEMENT,0,intensities,None,
         )
 
+    def prepare_base_with_intensity_factory(
+        self,
+        state: CGHState,
+        context: SectionContext,
+        intensity_factory: Callable[[TargetResolution],Any],
+    ) -> CGHJob:
+        """Prepare an isolated base target with caller-defined spot intensities.
+
+        This is used by calibration workflows that need the normal target and
+        computation stack without mutating the persistent CGH/feedback session.
+        """
+        if not callable(intensity_factory):
+            raise TypeError("intensity_factory must be callable")
+        target_state = self._resolve_requested_target_state(state,context)
+        target = self._build_target(target_state,context)
+        intensities = np.asarray(
+            intensity_factory(target.resolution),dtype=np.float64,
+        )
+        if intensities.shape != target.resolution.spot_intensities.shape:
+            raise ValueError(
+                "Transient target intensities must align with target resolution"
+            )
+        return self._prepare_job(
+            state,context,target_state,target,
+            CGHPreparedPurpose.TARGET_REPLACEMENT,0,intensities,None,
+        )
+
     def prepare_adapted(self,state: CGHState,context: SectionContext) -> CGHJob:
         """Prepare exactly the pending feedback-created working round."""
         target_state = self._resolve_requested_target_state(state,context)
@@ -236,6 +273,9 @@ class CGHSession:
             target,intensities,include_position=apply_position,
         )
         spec = self._build_spec(state,context,target_state,effective_signature)
+        initial_field,fixed_target_phase = self._compute_initialization_for(
+            spec,context,adaptation,
+        )
 
         self._generation += 1
         request = CGHPreparedRequest(
@@ -289,7 +329,8 @@ class CGHSession:
             target_name=str(target.name or spec.target_type),
             resolution=resolution,
             compute_func=compute_func,
-            initial_field=self._initial_field_for(spec,context),
+            initial_field=initial_field,
+            fixed_target_phase=fixed_target_phase,
             prepared_request=request,
         )
 
@@ -492,8 +533,9 @@ class CGHSession:
         matched = int(diagnostics.get(
             "matched_count",total if localization is not None else 0,
         ))
+        inferred = int(diagnostics.get("inferred_count",0) or 0)
         missing = int(diagnostics.get(
-            "missing_count",max(0,total-matched),
+            "missing_count",max(0,total-matched-inferred),
         ))
         unmatched = int(diagnostics.get("unmatched_detection_count",0) or 0)
         rms = diagnostics.get("rms_residual_px")
@@ -538,6 +580,7 @@ class CGHSession:
                 self._localization_reference is not None
             ),
             localization_matched_count=matched,
+            localization_inferred_count=inferred,
             localization_total_count=total,
             localization_missing_count=missing,
             localization_unmatched_detection_count=unmatched,
@@ -691,7 +734,12 @@ class CGHSession:
         return True
 
     def compute_feedback_intensity_analysis(
-        self,state: CGHState,context: SectionContext,localization=None,
+        self,
+        state: CGHState,
+        context: SectionContext,
+        localization=None,
+        *,
+        orientation: FeedbackOrientation | str=FeedbackOrientation.IDENTITY,
     ) -> IntensityAnalysis:
         """Compute experimental spot powers/metrics from one localization."""
         self._require_any_feedback_capability(state)
@@ -702,6 +750,7 @@ class CGHSession:
             raise RuntimeError(
                 "Localize the measurement before calculating intensity metrics"
             )
+        result = orient_localization(result,orientation)
         return analyze_measurement_intensity(
             measurement.acquisition,
             result,
@@ -736,12 +785,17 @@ class CGHSession:
         )
 
     def compute_feedback_measurement_metrics(
-        self,state: CGHState,context: SectionContext,localization=None,
+        self,
+        state: CGHState,
+        context: SectionContext,
+        localization=None,
+        *,
+        orientation: FeedbackOrientation | str=FeedbackOrientation.IDENTITY,
     ) -> MeasurementMetrics:
         """Compatibility view over the centralized experimental analysis."""
         return MeasurementMetrics.from_analysis(
             self.compute_feedback_intensity_analysis(
-                state,context,localization,
+                state,context,localization,orientation=orientation,
             )
         )
 
@@ -924,9 +978,10 @@ class CGHSession:
         analysis = self._current_intensity_analysis
         if analysis is None:
             analysis = self.compute_feedback_intensity_analysis(state,context)
-        if analysis.matched_count != analysis.total_count:
+        if analysis.used_count != analysis.total_count:
             raise RuntimeError(
-                "Intensity feedback requires a complete localization before adaptation"
+                "Intensity feedback requires every target spot to be localized "
+                "or explicitly inferred before adaptation"
             )
         current = np.asarray(current_round.intensities,dtype=np.float64)
         measured = np.asarray(analysis.spot_powers,dtype=np.float64)
@@ -980,7 +1035,11 @@ class CGHSession:
 
     def apply_position_correction(
         self,state: CGHState,context: SectionContext,
-        *,reset_intensity: bool=False,
+        *,
+        reset_intensity: bool=False,
+        orientation: FeedbackOrientation | str=FeedbackOrientation.IDENTITY,
+        reference_positions_px: np.ndarray | None=None,
+        reference_metadata: Mapping[str,Any] | None=None,
     ):
         self._require_capability(state,FeedbackCapability.POSITION_CORRECTION)
         measurement = self._require_current_measurement()
@@ -995,22 +1054,36 @@ class CGHSession:
             )
 
         target = self._current_round_target(state,context)
+        oriented_localization = orient_localization(
+            measurement.localization,orientation,
+        )
+        oriented_measurement = FeedbackMeasurement(
+            acquisition=measurement.acquisition,
+            localization=oriented_localization,
+            metrics=measurement.metrics,
+        )
+        ideal_positions = target.resolution.ideal_spot_positions_kxy
+        baseline_positions = self._fov_baseline_positions(target)
         analysis = analyze_position(
-            measurement,
-            ideal_positions_kxy=target.resolution.ideal_spot_positions_kxy,
+            oriented_measurement,
+            ideal_positions_kxy=ideal_positions,
+            baseline_positions_kxy=baseline_positions,
+            reference_positions_px=reference_positions_px,
             calibration=context.calibration,
             parameters=self._position_params,
         )
         correction = PositionCorrection(
-            measurement=measurement,
+            measurement=oriented_measurement,
             analysis=analysis,
             lattice_indices=target.resolution.lattice_indices,
-            ideal_positions_kxy=target.resolution.ideal_spot_positions_kxy,
+            ideal_positions_kxy=ideal_positions,
             displacement_kxy=analysis.correction_kxy,
             corrected_positions_kxy=analysis.corrected_positions_kxy,
             calibration=(
                 {} if context.calibration is None else context.calibration.to_dict()
             ),
+            reference=dict(reference_metadata or {}),
+            baseline_positions_kxy=baseline_positions,
         )
         committed = self._committed_target
         if committed is None:
@@ -1039,6 +1112,36 @@ class CGHSession:
         self._position_active = True
         self._reset_intensity_sequence(state,context)
         return correction,changed
+
+    def compute_feedback_position_analysis(
+        self,state: CGHState,context: SectionContext,
+        *,
+        orientation: FeedbackOrientation | str=FeedbackOrientation.IDENTITY,
+        reference_positions_px: np.ndarray | None=None,
+    ) -> PositionAnalysis:
+        """Preview position correction for the current measurement without mutation."""
+        self._require_capability(state,FeedbackCapability.POSITION_CORRECTION)
+        measurement = self._require_current_measurement()
+        if measurement.localization is None:
+            raise RuntimeError(
+                "Localize the feedback image before calculating position correction"
+            )
+        target = self._current_round_target(state,context)
+        oriented_localization = orient_localization(
+            measurement.localization,orientation,
+        )
+        return analyze_position(
+            FeedbackMeasurement(
+                acquisition=measurement.acquisition,
+                localization=oriented_localization,
+                metrics=measurement.metrics,
+            ),
+            ideal_positions_kxy=target.resolution.ideal_spot_positions_kxy,
+            baseline_positions_kxy=self._fov_baseline_positions(target),
+            reference_positions_px=reference_positions_px,
+            calibration=context.calibration,
+            parameters=self._position_params,
+        )
 
     def set_position_correction_active(
         self,state: CGHState,context: SectionContext,active: bool,
@@ -1501,10 +1604,12 @@ class CGHSession:
     ) -> CGHSignature:
         return compute_feedback_target_signature(
             target_signature=target_state.target_signature,
-            position_signature=(
-                compute_position_correction_signature(
+            position_signature=compute_position_layers_signature(
+                fov_calibration=self._fov_position_calibration,
+                position_correction=(
                     self._position_correction
-                ) if include_position and self._position_active else None
+                    if include_position and self._position_active else None
+                ),
             ),
             round_index=round_index,
             intensities=intensities,
@@ -1629,17 +1734,111 @@ class CGHSession:
                 "Stored intensity feedback is incompatible with target resolution"
             )
         positions = None
-        if (
-            include_position
-            and self._position_active
-            and self._position_correction is not None
-        ):
-            positions = self._position_correction.corrected_positions_kxy
+        if FeedbackCapability.POSITION_CORRECTION in set(target.feedback_capabilities):
+            positions = self._fov_baseline_positions(target)
+            if (
+                include_position
+                and self._position_active
+                and self._position_correction is not None
+            ):
+                positions = self._position_correction.corrected_positions_kxy
+            if np.array_equal(positions,base.spot_positions_kxy):
+                positions = None
         return target.with_resolution_updates(
             base,
             spot_positions_kxy=positions,
             spot_intensities=intensities,
         )
+
+    def _fov_baseline_positions(self,target: Target) -> np.ndarray:
+        base = target.resolution
+        ideal = np.asarray(base.ideal_spot_positions_kxy,dtype=np.float64)
+        calibration = self._fov_position_calibration
+        if calibration is None:
+            return ideal
+        if FeedbackCapability.POSITION_CORRECTION not in set(target.feedback_capabilities):
+            return ideal
+        return calibration.corrected_positions(ideal)
+
+    def fov_position_context(
+        self,state: CGHState,context: SectionContext,
+    ) -> Mapping[str,Any]:
+        calibration = self._fov_position_calibration
+        if state.selected_target is None:
+            empty = np.empty((2,0),dtype=np.float64)
+            return {
+                "supported":False,
+                "ideal_positions_kxy":empty,
+                "baseline_positions_kxy":np.array(empty,copy=True),
+                "displacement_kxy":np.array(empty,copy=True),
+                "outside_mask":np.empty((0,),dtype=bool),
+                "max_extrapolation_kxy":0.0,
+                "coverage_tolerance_kxy":0.0,
+                "calibration":calibration,
+            }
+        target_state = self._resolve_requested_target_state(state,context)
+        target = self._build_target(target_state,context)
+        supported = FeedbackCapability.POSITION_CORRECTION in set(
+            target.feedback_capabilities
+        )
+        ideal = np.asarray(target.resolution.ideal_spot_positions_kxy,dtype=np.float64)
+        if calibration is None or not supported:
+            baseline = ideal
+            outside = np.zeros(ideal.shape[1],dtype=bool)
+            maximum = tolerance = 0.0
+        else:
+            baseline = calibration.corrected_positions(ideal)
+            outside,maximum,tolerance = calibration.coverage_extrapolation(ideal)
+        return {
+            "supported":supported,
+            "ideal_positions_kxy":np.array(ideal,copy=True),
+            "baseline_positions_kxy":np.array(baseline,copy=True),
+            "displacement_kxy":np.array(baseline-ideal,copy=True),
+            "outside_mask":np.array(outside,copy=True),
+            "max_extrapolation_kxy":float(maximum),
+            "coverage_tolerance_kxy":float(tolerance),
+            "calibration":calibration,
+        }
+
+    def set_fov_position_calibration(
+        self,state: CGHState,context: SectionContext,
+        calibration: FOVPositionCalibration | None,
+    ) -> bool:
+        if calibration is not None and not isinstance(
+            calibration,FOVPositionCalibration
+        ):
+            raise TypeError(
+                "calibration must be an FOVPositionCalibration or None"
+            )
+        effective_changed = (
+            FeedbackCapability.POSITION_CORRECTION
+            in self._feedback_capabilities(state)
+        )
+        previous = self._fov_position_calibration
+        if (
+            previous is calibration
+            or (previous is not None and calibration is not None
+                and previous.to_dict() == calibration.to_dict())
+        ):
+            return False
+        self._fov_position_calibration = calibration
+        if not effective_changed:
+            # Keep the selected/default calibration ready for a future compatible
+            # target, but do not disturb an intensity-only or non-CGH session.
+            return False
+
+        self.invalidate_prepared_compute()
+        self._position_correction = None
+        self._position_reference_round = None
+        self._position_active = False
+        self._working_round = None
+        if self._rounds:
+            base = self._rounds[0].with_evaluation(None)
+            self._rounds = (base,)
+        self._localization_reference = None
+        self._prefer_previous_initialization = False
+        self._requires_fresh_initialization = True
+        return True
 
     @staticmethod
     def _validate_position_correction_for_resolution(
@@ -1659,6 +1858,10 @@ class CGHSession:
         ):
             raise RuntimeError(
                 "Position correction ideal positions do not match target resolution"
+            )
+        if correction.baseline_positions_kxy.shape != base.spot_positions_kxy.shape:
+            raise RuntimeError(
+                "Position correction baseline is incompatible with target resolution"
             )
         if correction.corrected_positions_kxy.shape != base.spot_positions_kxy.shape:
             raise RuntimeError(
@@ -1702,6 +1905,39 @@ class CGHSession:
             compute_params=ui_target_state.computation.params.values,
             feedback_target_signature=effective_signature,
         )
+
+    def _compute_initialization_for(
+        self,
+        spec: CGHSpec,
+        context: SectionContext,
+        adaptation: IntensityAdaptation | None,
+    ) -> tuple[np.ndarray | None,np.ndarray | None]:
+        if adaptation is None or spec.algorithm != "gerchberg_saxton":
+            return self._initial_field_for(spec,context),None
+
+        source = next((
+            round_ for round_ in self._rounds
+            if round_.index == adaptation.source_round_index
+        ),None)
+        if source is None:
+            raise RuntimeError(
+                "Intensity feedback source round is no longer available"
+            )
+        result = source.result
+        if result.spec.target_type != spec.target_type or result.spec.algorithm != spec.algorithm:
+            raise RuntimeError(
+                "Intensity feedback source CGH does not match the requested algorithm"
+            )
+        if result.pattern.shape != context.shape:
+            raise RuntimeError(
+                "Intensity feedback source CGH shape no longer matches the section"
+            )
+        if result.target_phase is None:
+            raise RuntimeError(
+                "Intensity feedback source CGH has no retained target phase; "
+                "recompute the source/base CGH once before adapting it."
+            )
+        return result.pattern,result.target_phase
 
     def _initial_field_for(
         self,spec: CGHSpec,context: SectionContext,

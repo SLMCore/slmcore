@@ -27,6 +27,8 @@ from .application import (
     CorrectionMismatchPolicy,
     FeedbackParameterUpdateResult,
     MeasurementDispatcher,
+    PositionReferenceContext,
+    PositionReferenceSelection,
     PreparedConfigLoad,
     PreparedPlaneSelection,
     PreparedSectionLayoutChange,
@@ -41,6 +43,11 @@ from .application import (
     StartupPreferencesState,
     StartupRuntime,
     TargetCalibrationState,
+)
+from .core.cgh.feedback import (
+    EditablePositionReferenceGeometry,FOVPositionCalibration,
+    GeometryOrientationAnalysis,GeometryOrientationCalibration,
+    PositionReference,PositionReferenceMode,
 )
 from .core.calibration import SLMSectionCalibration
 from .core.config import (
@@ -84,6 +91,8 @@ from .setup import (
     SLMDefinition,
     SLMHardwareConfig,
     SLMSectionsDefinition,
+    FeedbackOrientationPreferences,
+    FOVPositionCalibrationPreferences,
     SLMStartupPreferences,
     load_slm_setup_file,
     save_slm_startup_preferences,
@@ -94,6 +103,9 @@ from .workspace import (
     SLMConfigMetadata,
     SLMConfigStore,
     SLMCorrectionStore,
+    SLMPositionReferenceStore,
+    SLMFOVPositionCalibrationStore,
+    SLMGeometryOrientationCalibrationStore,
     SLMWorkspace,
 )
 
@@ -112,6 +124,14 @@ __all__ = [
     "GroupTopology",
     "ImageMeasurement",
     "MeasurementDispatcher",
+    "EditablePositionReferenceGeometry",
+    "FOVPositionCalibration",
+    "GeometryOrientationAnalysis",
+    "GeometryOrientationCalibration",
+    "PositionReference",
+    "PositionReferenceContext",
+    "PositionReferenceMode",
+    "PositionReferenceSelection",
     "PreparedConfigLoad",
     "PreparedPlaneSelection",
     "PreparedSectionLayoutChange",
@@ -140,6 +160,9 @@ __all__ = [
     "SLMConfigurationService",
     "SLMControlMode",
     "SLMCorrectionStore",
+    "SLMPositionReferenceStore",
+    "SLMFOVPositionCalibrationStore",
+    "SLMGeometryOrientationCalibrationStore",
     "SLMFeedbackService",
     "SLMGeometry",
     "SLMHardwareConfig",
@@ -157,6 +180,8 @@ __all__ = [
     "SLMSession",
     "SLMSessionCallbacks",
     "SLMDefinition",
+    "FeedbackOrientationPreferences",
+    "FOVPositionCalibrationPreferences",
     "SLMStartupPreferences",
     "SLMWorkspace",
     "StartupPreferencesState",

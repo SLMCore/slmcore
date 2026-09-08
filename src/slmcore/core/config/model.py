@@ -274,6 +274,10 @@ def _cgh_result_to_dict(result: CGHResult | None):
         "generation":result.generation,
         "target_name":result.target_name,
         "pattern":np.array(result.pattern,copy=True),
+        "target_phase":(
+            None if result.target_phase is None
+            else np.array(result.target_phase,copy=True)
+        ),
         "spec":{
             "context":_context_to_dict(result.spec.context),
             "target_type":result.spec.target_type,
@@ -330,6 +334,10 @@ def _cgh_result_from_dict(
         spec=spec,
         target_name=str(data.get("target_name") or spec.target_type),
         pattern=np.asarray(data["pattern"]),
+        target_phase=(
+            None if data.get("target_phase") is None
+            else np.asarray(data["target_phase"])
+        ),
         metrics=metrics,
         warnings=tuple(data.get("warnings",())),
         diagnostics=data.get("diagnostics",{}),
@@ -599,6 +607,7 @@ def _measurement_metrics_to_dict(value):
         "geometry_type":value.geometry_type,
         "values":deepcopy(dict(value.values)),
         "matched_count":value.matched_count,
+        "inferred_count":value.inferred_count,
         "total_count":value.total_count,
     }
 
@@ -611,6 +620,7 @@ def _measurement_metrics_from_dict(data):
         geometry_type=str(data.get("geometry_type","unknown")),
         values=data.get("values",{}),
         matched_count=int(data.get("matched_count",0)),
+        inferred_count=int(data.get("inferred_count",0)),
         total_count=int(data.get("total_count",0)),
     )
 
@@ -629,6 +639,7 @@ def _intensity_analysis_to_dict(
         "normalized_std":value.normalized_std,
         "integration_preview":np.array(value.integration_preview,copy=True),
         "matched_count":value.matched_count,
+        "inferred_count":value.inferred_count,
         "total_count":value.total_count,
     }
 
@@ -647,6 +658,7 @@ def _intensity_analysis_from_dict(
         normalized_std=float(data["normalized_std"]),
         integration_preview=np.asarray(data["integration_preview"]),
         matched_count=int(data.get("matched_count",len(data["spot_powers"]))),
+        inferred_count=int(data.get("inferred_count",0)),
         total_count=int(data.get("total_count",len(data["spot_powers"]))),
     )
 
@@ -698,7 +710,11 @@ def _position_correction_to_dict(
         "corrected_positions_kxy":np.array(
             value.corrected_positions_kxy,copy=True,
         ),
+        "baseline_positions_kxy":np.array(
+            value.baseline_positions_kxy,copy=True,
+        ),
         "calibration":deepcopy(dict(value.calibration)),
+        "reference":deepcopy(dict(value.reference)),
     }
 
 
@@ -716,4 +732,9 @@ def _position_correction_from_dict(
         displacement_kxy=np.asarray(data["displacement_kxy"]),
         corrected_positions_kxy=np.asarray(data["corrected_positions_kxy"]),
         calibration=data.get("calibration",{}),
+        baseline_positions_kxy=(
+            None if data.get("baseline_positions_kxy") is None
+            else np.asarray(data["baseline_positions_kxy"])
+        ),
+        reference=data.get("reference",{}),
     )

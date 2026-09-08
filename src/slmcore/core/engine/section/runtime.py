@@ -35,6 +35,7 @@ from ...cgh import (
     FeedbackStatus,
 )
 from ...cgh.targets.lattice import LatticeLockRequest
+from ...cgh.feedback.geometry_calibration import geometry_orientation_code
 from ...cgh.localization import (
     TargetLocalizationReference,
     localization_context,
@@ -562,6 +563,56 @@ class SLMSectionRuntime:
             self.state.cgh,self._build_context(self.state),
         )
 
+    def prepare_geometry_orientation_cgh(
+        self,
+        *,
+        grid_x: int,
+        grid_y: int,
+        period_x_px: float,
+        period_y_px: float,
+    ) -> tuple["SLMSectionRuntime",CGHJob]:
+        """Prepare an isolated asymmetric lattice calibration computation.
+
+        Only the target definition is replaced.  The detached runtime retains
+        the section optics, analytic phases, aberrations, corrections and CGH
+        computation parameters.  Persistent CGH/feedback state is untouched.
+        """
+        grid_x,grid_y=int(grid_x),int(grid_y)
+        period_x_px,period_y_px=float(period_x_px),float(period_y_px)
+        if grid_x < 2 or grid_y < 2:
+            raise ValueError("Geometry calibration grid dimensions must be >= 2")
+        if period_x_px <= 0 or period_y_px <= 0:
+            raise ValueError("Geometry calibration periods must be > 0")
+        target_key=self.state.cgh.selected_target
+        if target_key is None:
+            raise RuntimeError("Select a CGH target before geometry calibration")
+        params=self.state.cgh.items[target_key].params.values
+        required={"period_x_px","period_y_px","n_foci_x","n_foci_y"}
+        if not required.issubset(params):
+            raise RuntimeError(
+                "Geometry orientation calibration requires a rectangular lattice target"
+            )
+        candidate=self.clone()
+        prefix=("cgh",target_key,"params")
+        changes={
+            prefix+("period_x_px",):period_x_px,
+            prefix+("period_y_px",):period_y_px,
+            prefix+("n_foci_x",):grid_x,
+            prefix+("n_foci_y",):grid_y,
+        }
+        for key,value in (
+            ("square",False),("rotation_deg",0.0),("skew_deg",0.0),("stagger",0.0),
+        ):
+            if key in params:
+                changes[prefix+(key,)]=value
+        candidate.apply_patch(changes)
+        candidate.validate()
+        job=candidate._cgh_session.prepare_base_with_intensity_factory(
+            candidate.state.cgh,candidate._build_context(candidate.state),
+            lambda resolution:geometry_orientation_code(resolution.lattice_indices),
+        )
+        return candidate,job
+
     def prepare_adapted_cgh(self) -> CGHJob:
         """Prepare exactly the pending feedback-adapted working round."""
         self.validate()
@@ -623,11 +674,14 @@ class SLMSectionRuntime:
             target_signature=target.signature,
         )
 
-    def compute_feedback_intensity_analysis(self,localization=None):
+    def compute_feedback_intensity_analysis(
+        self,localization=None,*,orientation="identity",
+    ):
         """Calculate centralized experimental intensity analysis without mutation."""
         candidate = self._cgh_session.clone()
         return candidate.compute_feedback_intensity_analysis(
             self.state.cgh,self._build_context(self.state),localization,
+            orientation=orientation,
         )
 
     def set_feedback_intensity_analysis(self,analysis) -> None:
@@ -636,11 +690,14 @@ class SLMSectionRuntime:
         candidate.set_feedback_intensity_analysis(analysis)
         self._cgh_session = candidate
 
-    def compute_feedback_measurement_metrics(self,localization=None):
+    def compute_feedback_measurement_metrics(
+        self,localization=None,*,orientation="identity",
+    ):
         """Calculate geometry-defined metrics without mutating section state."""
         candidate = self._cgh_session.clone()
         return candidate.compute_feedback_measurement_metrics(
             self.state.cgh,self._build_context(self.state),localization,
+            orientation=orientation,
         )
 
     def set_feedback_measurement_metrics(self,metrics) -> None:
@@ -722,7 +779,8 @@ class SLMSectionRuntime:
         return True
 
     def apply_position_correction(
-            self, *, reset_intensity: bool=False
+            self, *, reset_intensity: bool=False,orientation="identity",
+            reference_positions_px=None,reference_metadata=None,
         ) -> bool:
         """Calculate/replace the one-shot position correction from ideal positions."""
         candidate = self._cgh_session.clone()
@@ -730,6 +788,33 @@ class SLMSectionRuntime:
             self.state.cgh,
             self._build_context(self.state),
             reset_intensity=reset_intensity,
+            orientation=orientation,
+            reference_positions_px=reference_positions_px,
+            reference_metadata=reference_metadata,
+        )
+        self._commit_feedback_session(candidate,effective_changed)
+        return effective_changed
+
+    def compute_feedback_position_analysis(
+        self,*,orientation="identity",reference_positions_px=None,
+    ):
+        """Calculate a position-correction preview without mutating section state."""
+        candidate = self._cgh_session.clone()
+        return candidate.compute_feedback_position_analysis(
+            self.state.cgh,self._build_context(self.state),
+            orientation=orientation,
+            reference_positions_px=reference_positions_px,
+        )
+
+    def get_fov_position_context(self):
+        return self._cgh_session.fov_position_context(
+            self.state.cgh,self._build_context(self.state),
+        )
+
+    def set_fov_position_calibration(self,calibration) -> bool:
+        candidate = self._cgh_session.clone()
+        effective_changed = candidate.set_fov_position_calibration(
+            self.state.cgh,self._build_context(self.state),calibration,
         )
         self._commit_feedback_session(candidate,effective_changed)
         return effective_changed

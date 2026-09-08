@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any,Mapping,Sequence
 
 import numpy as np
@@ -9,6 +10,9 @@ from qtpy import QtCore,QtWidgets
 from ....application.feedback import AutomaticFeedbackState
 from ....core.measurement import ImageMeasurement,create_image_measurement
 from ...cgh.session_window import CGHSessionWindow,MeasurementsAction
+
+
+_logger = logging.getLogger(__name__)
 
 
 class FeedbackCoordinator(QtCore.QObject):
@@ -60,6 +64,10 @@ class FeedbackCoordinator(QtCore.QObject):
                     localization_context=self.localization_context(section_key),
                     detectors=sources,
                     current_detector=current,
+                    feedback_orientation=self.service.feedback_orientation(section_key),
+                    feedback_orientation_context=(
+                        self._feedback_orientation_ui_context(section_key)
+                    ),
                     cgh_summary=self.measurements_cgh_summary(section_key),
                     title="CGH Session - %s/%s" % (
                         self.controller.presenter.display_name,section_key,
@@ -75,6 +83,9 @@ class FeedbackCoordinator(QtCore.QObject):
                     lambda _obj=None,key=section_key:
                         self._windows.pop(key,None)
                 )
+                self._synchronize_position_reference(section_key,window)
+                self._synchronize_fov_position_calibration(section_key,window)
+                self._synchronize_geometry_orientation_calibration(section_key,window)
             else:
                 window.configure_detectors(sources,current)
                 self.synchronize_section(section_key)
@@ -108,7 +119,12 @@ class FeedbackCoordinator(QtCore.QObject):
             runtime.get_section_cgh_status(section_key),
             self.localization_context(section_key),
             self.measurements_cgh_summary(section_key),
+            self.service.feedback_orientation(section_key),
+            self._feedback_orientation_ui_context(section_key),
         )
+        self._synchronize_position_reference(section_key,window)
+        self._synchronize_fov_position_calibration(section_key,window)
+        self._synchronize_geometry_orientation_calibration(section_key,window)
         self._configure_automatic_availability(window)
         self._apply_automatic_state_to_window(section_key,window)
 
@@ -125,6 +141,192 @@ class FeedbackCoordinator(QtCore.QObject):
         self,section_key: str,available: Sequence[str],
     ) -> str | None:
         return self.service.preferred_source(section_key,available)
+
+    def _feedback_orientation_ui_context(
+        self,section_key: str,
+    ) -> dict[str,Any]:
+        context = self.service.feedback_orientation_context(section_key)
+        return {
+            "plane_name":context.plane_name,
+            "plane_override":context.plane_override,
+            "saved_orientation":context.saved_orientation.value,
+            "calibrated":context.calibrated,
+            "change_enabled":context.change_allowed,
+            "change_reason":context.change_unavailable_reason,
+        }
+
+    def _position_reference_ui_context(
+        self,section_key: str,
+    ) -> dict[str,Any]:
+        context = self.service.position_reference_context(section_key)
+        selection = context.selection
+        return {
+            "mode":selection.mode.value,
+            "saved_name":selection.saved_name,
+            "saved_names":context.saved_names,
+            "editable_geometry":(
+                None if selection.editable_geometry is None
+                else selection.editable_geometry.to_dict()
+            ),
+            "editable_locks":{
+                name:(name in selection.editable_locks)
+                for name in (
+                    "period_x_px","period_y_px",
+                    "rotation_deg","lattice_angle_deg",
+                )
+            },
+            "fit_geometry":(
+                None if context.fit_geometry is None
+                else context.fit_geometry.to_dict()
+            ),
+            "plane_name":context.plane_name,
+            "compatible":context.compatible,
+            "compatibility_error":context.compatibility_error,
+            "change_allowed":context.change_allowed,
+            "change_unavailable_reason":context.change_unavailable_reason,
+            "save_allowed":context.save_allowed,
+            "save_unavailable_reason":context.save_unavailable_reason,
+        }
+
+    def _synchronize_position_reference(
+        self,section_key: str,window: CGHSessionWindow,
+    ) -> None:
+        window.set_position_reference_state(
+            self._position_reference_ui_context(section_key),
+            self.service.position_reference_preview(section_key),
+        )
+
+    def _synchronize_fov_position_calibration(
+        self,section_key: str,window: CGHSessionWindow,
+    ) -> None:
+        window.set_fov_position_calibration_state(
+            self.service.fov_position_calibration_context(section_key),
+            self.service.fov_position_calibration_preview(section_key),
+        )
+
+    def _synchronize_geometry_orientation_calibration(
+        self,section_key: str,window: CGHSessionWindow,
+    ) -> None:
+        window.set_geometry_orientation_calibration_state(
+            self.service.geometry_orientation_calibration_context(section_key)
+        )
+
+    @staticmethod
+    def _log_geometry_error(
+        section_key: str,stage: str,error: Exception,
+    ) -> None:
+        _logger.error(
+            "Geometry orientation calibration %s failed for section %s: %s",
+            str(stage),str(section_key),error,
+            exc_info=(type(error),error,error.__traceback__),
+        )
+
+    def _geometry_compute_complete(
+        self,section_key: str,success: bool,error: Exception | None,
+    ) -> None:
+        window=self._windows.get(section_key)
+        self.controller.synchronize_section(section_key)
+        if success:
+            if window is not None:
+                window.measurement_view.set_measurement_status(
+                    'Geometry calibration target is displayed on the SLM. '
+                    'Adjust detector/exposure, then Acquire or Load and Localize.'
+                )
+            return
+        if error is not None:
+            self._log_geometry_error(section_key,'target computation/upload',error)
+            self._error('Geometry calibration failed',error)
+
+    def _geometry_acquisition_complete(
+        self,section_key: str,success: bool,error: Exception | None,
+    ) -> None:
+        window=self._windows.get(section_key)
+        self.controller.synchronize_section(section_key)
+        if success:
+            if window is not None:
+                window.measurement_view.set_measurement_status(
+                    'Geometry calibration image acquired. Fine-tune localization '
+                    'parameters and click Localize.'
+                )
+            return
+        if error is not None:
+            self._log_geometry_error(section_key,'acquisition',error)
+            if window is not None:
+                window.measurement_view.set_measurement_status(
+                    'Geometry calibration acquisition failed (%s). The calibration '
+                    'target remains displayed; adjust acquisition settings and retry.' % error,
+                    warning=True,
+                )
+            else:
+                self._error('Geometry calibration acquisition failed',error)
+
+    def compute_geometry_orientation_calibration(
+        self,section_key: str,values: Mapping[str,Any],
+    ) -> None:
+        try:
+            self.controller.flush_section(section_key,propagate=True)
+            px=float(values.get('period_x')); py=float(values.get('period_y'))
+            if str(values.get('period_unit') or '') == 'um':
+                px=self.service.geometry_period_from_um(section_key,px,'x')
+                py=self.service.geometry_period_from_um(section_key,py,'y')
+            self.service.compute_geometry_orientation_calibration_target(
+                section_key,grid_x=int(values.get('grid_x',5)),grid_y=int(values.get('grid_y',4)),
+                period_x_px=px,period_y_px=py,source=str(values.get('detector') or ''),
+                on_complete=lambda success,error,key=section_key:self._geometry_compute_complete(key,success,error),
+            )
+        except Exception as error:
+            self._log_geometry_error(section_key,'target computation setup',error)
+            self._error('Geometry calibration failed',error)
+            self.controller.synchronize_section(section_key)
+
+    def acquire_geometry_orientation_calibration(self,section_key: str,source: str) -> None:
+        try:
+            self.service.acquire_geometry_orientation_calibration(
+                section_key,source,
+                on_complete=lambda success,error,key=section_key:self._geometry_acquisition_complete(key,success,error),
+            )
+        except Exception as error:
+            self._log_geometry_error(section_key,'acquisition setup',error)
+            self._set_measurement_error(section_key,error)
+
+    def load_geometry_orientation_calibration(self,section_key: str) -> None:
+        try:
+            parent=self._windows.get(section_key)
+            path,_selected=QtWidgets.QFileDialog.getOpenFileName(
+                parent,'Select geometry calibration image','',
+                'Images (*.tif *.tiff *.png *.jpg *.jpeg *.bmp);;All files (*)',
+            )
+            if not path:return
+            image=np.asarray(Image.open(path).convert('F'),dtype=np.float64)
+            measurement=create_image_measurement(image,source='file',metadata={'path':str(path),'workflow':'geometry_orientation_calibration'})
+            self.service.set_geometry_orientation_calibration_measurement(section_key,measurement)
+            self.controller.synchronize_section(section_key)
+        except Exception as error:
+            self._log_geometry_error(section_key,'image load',error)
+            self._set_measurement_error(section_key,error)
+
+    def run_geometry_orientation_localization(
+        self,section_key: str,parameters: Mapping[str,Any],
+    ) -> None:
+        try:
+            self.service.geometry_orientation_localization_candidate(section_key,parameters)
+            self.controller.synchronize_section(section_key)
+        except Exception as error:
+            self._log_geometry_error(section_key,'localization',error)
+            self._set_localization_error(section_key,error)
+
+    def finish_geometry_orientation_calibration(self,section_key: str) -> None:
+        try:
+            self.service.finish_geometry_orientation_calibration(section_key)
+            self.controller.synchronize_section(section_key)
+            window=self._windows.get(section_key)
+            if window is not None:
+                window.measurement_view.set_measurement_status(
+                    'Geometry calibration finished. Current experiment CGH restored.'
+                )
+        except Exception as error:
+            self._log_geometry_error(section_key,'finish/restore',error)
+            self._error('Finishing geometry calibration failed',error)
 
     def request_measurement(
         self,
@@ -205,6 +407,21 @@ class FeedbackCoordinator(QtCore.QObject):
         try:
             candidate,metrics = self.service.localization_candidate(
                 section_key,parameters,
+            )
+            window = self._windows.get(section_key)
+            if window is not None:
+                window.set_localization_result(
+                    candidate,parameters,metrics=metrics,
+                )
+        except Exception as error:
+            self._set_localization_error(section_key,error)
+
+    def infer_missing_localization_candidate(
+        self,section_key: str,localization: Any,parameters: Mapping[str,Any],
+    ) -> None:
+        try:
+            candidate,metrics = self.service.infer_missing_localization_candidate(
+                section_key,localization,
             )
             window = self._windows.get(section_key)
             if window is not None:
@@ -502,22 +719,40 @@ class FeedbackCoordinator(QtCore.QObject):
             return
 
         if request is MeasurementsAction.ACQUIRE:
-            self.acquire(
-                section_key,str(values.get("detector") or ""),
-                reuse_previous_localization=bool(
-                    values.get("reuse_previous_localization",False)
-                ),
-            )
+            if values.get("geometry_calibration"):
+                self.acquire_geometry_orientation_calibration(
+                    section_key,str(values.get("detector") or ""),
+                )
+            else:
+                self.acquire(
+                    section_key,str(values.get("detector") or ""),
+                    reuse_previous_localization=bool(
+                        values.get("reuse_previous_localization",False)
+                    ),
+                )
         elif request is MeasurementsAction.LOAD:
-            self.load(
-                section_key,
-                reuse_previous_localization=bool(
-                    values.get("reuse_previous_localization",False)
-                ),
-            )
+            if values.get("geometry_calibration"):
+                self.load_geometry_orientation_calibration(section_key)
+            else:
+                self.load(
+                    section_key,
+                    reuse_previous_localization=bool(
+                        values.get("reuse_previous_localization",False)
+                    ),
+                )
         elif request is MeasurementsAction.LOCALIZATION_RUN:
-            self.run_localization_candidate(
-                section_key,values.get("parameters",{}),
+            if values.get("geometry_calibration"):
+                self.run_geometry_orientation_localization(
+                    section_key,values.get("parameters",{}),
+                )
+            else:
+                self.run_localization_candidate(
+                    section_key,values.get("parameters",{}),
+                )
+        elif request is MeasurementsAction.LOCALIZATION_INFER_MISSING:
+            self.infer_missing_localization_candidate(
+                section_key,values.get("localization"),
+                values.get("parameters",{}),
             )
         elif request is MeasurementsAction.LOCALIZATION_ACCEPT:
             self.accept_localization(
@@ -535,12 +770,72 @@ class FeedbackCoordinator(QtCore.QObject):
                     "localization_parameters",{}
                 ),
             )
+        elif request is MeasurementsAction.GEOMETRY_CALIBRATION_COMPUTE:
+            self.compute_geometry_orientation_calibration(section_key,values)
+        elif request is MeasurementsAction.GEOMETRY_CALIBRATION_ANALYZE:
+            try:
+                analysis=self.service.analyze_geometry_orientation_calibration(section_key)
+                self.controller.synchronize_section(section_key)
+                if not analysis.accepted:
+                    window=self._windows.get(section_key)
+                    if window is not None:
+                        window.measurement_view.set_measurement_status(
+                            'Geometry orientation is ambiguous; adjust/reacquire before saving.',warning=True,
+                        )
+            except Exception as error:
+                self._log_geometry_error(section_key,'analysis',error)
+                self._error('Geometry calibration analysis failed',error)
+        elif request is MeasurementsAction.GEOMETRY_CALIBRATION_SAVE:
+            try:
+                self.service.save_geometry_orientation_calibration(section_key)
+                self.controller.synchronize_section(section_key)
+            except Exception as error:
+                self._log_geometry_error(section_key,'save',error)
+                self._error('Saving geometry calibration failed',error)
+        elif request is MeasurementsAction.GEOMETRY_CALIBRATION_FINISH:
+            self.finish_geometry_orientation_calibration(section_key)
+        elif request is MeasurementsAction.FEEDBACK_ORIENTATION:
+            self.service.set_feedback_orientation(
+                section_key,values.get("orientation","identity"),
+            )
+        elif request is MeasurementsAction.FEEDBACK_ORIENTATION_SAVE:
+            self.service.save_feedback_orientation(section_key)
         elif request is MeasurementsAction.INTENSITY_APPLY:
             self.apply_intensity_feedback(section_key)
         elif request is MeasurementsAction.INTENSITY_RESET:
             self.reset_intensity_feedback(section_key)
         elif request is MeasurementsAction.POSITION_APPLY:
             self.apply_position_correction(section_key)
+        elif request is MeasurementsAction.POSITION_REFERENCE_SET:
+            self.set_position_reference(
+                section_key,
+                mode=str(values.get("mode") or "global_fit"),
+                saved_name=values.get("saved_name"),
+                editable_geometry=values.get("editable_geometry"),
+                editable_locks=values.get("editable_locks"),
+            )
+        elif request is MeasurementsAction.POSITION_REFERENCE_FIT_CENTER:
+            self.fit_position_reference_center(section_key)
+        elif request is MeasurementsAction.POSITION_REFERENCE_SAVE:
+            self.save_position_reference(
+                section_key,str(values.get("name") or "").strip(),
+            )
+        elif request is MeasurementsAction.POSITION_REFERENCE_DELETE:
+            self.delete_position_reference(
+                section_key,str(values.get("name") or "").strip(),
+            )
+        elif request is MeasurementsAction.FOV_CALIBRATION_FIT:
+            self.fit_fov_position_calibration(
+                section_key,
+                model=str(values.get("model") or "polynomial"),
+                degree=int(values.get("degree") or 2),
+            )
+        elif request is MeasurementsAction.FOV_CALIBRATION_SAVE:
+            self.save_fov_position_calibration(
+                section_key,str(values.get("name") or "").strip(),
+            )
+        elif request is MeasurementsAction.FOV_CALIBRATION_REPLACE:
+            self.replace_applied_fov_position_calibration(section_key)
         elif request is MeasurementsAction.POSITION_SET_ACTIVE:
             self.set_position_active(
                 section_key,bool(values.get("active",False)),
@@ -581,6 +876,144 @@ class FeedbackCoordinator(QtCore.QObject):
                 )
             except Exception as error:
                 self._error("Automatic feedback failed",error)
+
+    def set_position_reference(
+        self,
+        section_key: str,
+        *,
+        mode: str,
+        saved_name: str | None,
+        editable_geometry: Mapping[str,Any] | None=None,
+        editable_locks: Mapping[str,Any] | None=None,
+    ) -> None:
+        try:
+            self.controller.flush_section(section_key,propagate=True)
+            self.service.set_position_reference(
+                section_key,
+                mode=mode,
+                saved_name=saved_name,
+                editable_geometry=editable_geometry,
+                editable_locks=editable_locks,
+            )
+        except Exception as error:
+            self._error("Changing position reference failed",error)
+            self.controller.synchronize_section(section_key)
+
+    def fit_position_reference_center(self,section_key: str) -> None:
+        try:
+            self.controller.flush_section(section_key,propagate=True)
+            self.service.fit_position_reference_center(section_key)
+        except Exception as error:
+            self._error("Fitting center reference failed",error)
+            self.controller.synchronize_section(section_key)
+
+    def save_position_reference(self,section_key: str,name: str) -> None:
+        if not name:
+            return
+        try:
+            self.service.save_position_reference(section_key,name)
+        except FileExistsError:
+            parent = self._windows.get(section_key)
+            answer = QtWidgets.QMessageBox.question(
+                parent,
+                "Replace position reference",
+                'Position reference "%s" already exists for this plane. Replace it?'
+                % name,
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
+            )
+            if answer != QtWidgets.QMessageBox.Yes:
+                return
+            try:
+                self.service.save_position_reference(
+                    section_key,name,overwrite=True,
+                )
+            except Exception as error:
+                self._error("Saving position reference failed",error)
+        except Exception as error:
+            self._error("Saving position reference failed",error)
+
+    def delete_position_reference(self,section_key: str,name: str) -> None:
+        if not name:
+            return
+        parent = self._windows.get(section_key)
+        answer = QtWidgets.QMessageBox.question(
+            parent,
+            "Delete position reference",
+            'Delete saved position reference "%s"?' % name,
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        if answer != QtWidgets.QMessageBox.Yes:
+            return
+        try:
+            self.service.delete_position_reference(section_key,name)
+        except Exception as error:
+            self._error("Deleting position reference failed",error)
+
+    def fit_fov_position_calibration(
+        self,section_key: str,*,model: str="polynomial",degree: int=2,
+    ) -> None:
+        try:
+            self.controller.flush_section(section_key,propagate=True)
+            self.service.fit_fov_position_calibration(
+                section_key,model=model,degree=degree,
+            )
+            self.controller.synchronize_section(section_key)
+        except Exception as error:
+            self._error("Fitting FOV calibration failed",error)
+            self.controller.synchronize_section(section_key)
+
+    def save_fov_position_calibration(self,section_key: str,name: str) -> None:
+        if not name:
+            return
+        try:
+            self.service.save_fov_position_calibration(section_key,name)
+        except FileExistsError:
+            parent = self._windows.get(section_key)
+            answer = QtWidgets.QMessageBox.question(
+                parent,"Replace FOV calibration",
+                'FOV calibration "%s" already exists for this SLM/section/plane. Replace it?'
+                % name,
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
+            )
+            if answer != QtWidgets.QMessageBox.Yes:
+                return
+            try:
+                self.service.save_fov_position_calibration(
+                    section_key,name,overwrite=True,
+                )
+            except Exception as error:
+                self._error("Saving FOV calibration failed",error)
+        except Exception as error:
+            self._error("Saving FOV calibration failed",error)
+        self.controller.synchronize_section(section_key)
+
+    def replace_applied_fov_position_calibration(self,section_key: str) -> None:
+        parent = self._windows.get(section_key)
+        context = self.service.fov_position_calibration_context(section_key)
+        name = context.get("selected_name")
+        if not name:
+            return
+        warning = self.service.fov_position_calibration_replacement_warning(
+            section_key
+        )
+        text = 'Replace applied FOV calibration "%s" with the current fit?' % name
+        if warning:
+            text += "\n\n" + warning
+        answer = QtWidgets.QMessageBox.question(
+            parent,"Replace applied FOV calibration",text,
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        if answer != QtWidgets.QMessageBox.Yes:
+            return
+        try:
+            self.service.replace_applied_fov_position_calibration(section_key)
+        except Exception as error:
+            self._error("Replacing FOV calibration failed",error)
+        self.controller.synchronize_section(section_key)
 
     def _configure_automatic_availability(self,window: CGHSessionWindow) -> None:
         window.set_automatic_feedback_available(

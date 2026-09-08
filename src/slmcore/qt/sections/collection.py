@@ -28,6 +28,7 @@ class SectionsCollectionView(QtCore.QObject):
     sigActivePlaneRequested = QtCore.Signal(str,str)
     sigAddPlaneRequested = QtCore.Signal(str)
     sigDeletePlaneRequested = QtCore.Signal(str,str)
+    sigDeleteCalibrationRequested = QtCore.Signal(str,str)
     sigCalibrationRequested = QtCore.Signal(str)
     sigCghActionRequested = QtCore.Signal(str,str,object)
     sigTargetLockRequested = QtCore.Signal(str,str,object)
@@ -165,6 +166,13 @@ class SectionsCollectionView(QtCore.QObject):
     def set_feedback_status(self,section_key: str,status) -> None:
         self.section_view(section_key).apply_feedback_status(status)
 
+    def set_fov_position_calibration_context(
+        self,section_key: str,context,
+    ) -> None:
+        self.section_view(section_key).set_fov_position_calibration_context(
+            context
+        )
+
     def auto_recompute_enabled(self,section_key: str) -> bool:
         return self.section_view(section_key).auto_recompute_enabled()
 
@@ -209,6 +217,9 @@ class SectionsCollectionView(QtCore.QObject):
         )
         view.sigDeletePlaneRequested.connect(
             self.sigDeletePlaneRequested.emit,
+        )
+        view.sigDeleteCalibrationRequested.connect(
+            self.sigDeleteCalibrationRequested.emit,
         )
         view.sigCalibrationRequested.connect(
             self.sigCalibrationRequested.emit,

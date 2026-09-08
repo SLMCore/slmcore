@@ -48,6 +48,7 @@ class SLMQtSession(QtCore.QObject):
     sigWarning = QtCore.Signal(str,object)
     sigInfo = QtCore.Signal(str,object)
     sigUploadFailed = QtCore.Signal(object)
+    sigDeviceConnectionChanged = QtCore.Signal(object)
     sigStatusChanged = QtCore.Signal(str,bool)
     sigInteractionSettingsChanged = QtCore.Signal(object)
     sigControlModeChanged = QtCore.Signal(object)
@@ -93,6 +94,7 @@ class SLMQtSession(QtCore.QObject):
             on_error=self.sigError.emit,
             on_upload_failed=self.sigUploadFailed.emit,
             on_upload_state_changed=self._on_application_upload_state_changed,
+            on_device_connection_changed=self.sigDeviceConnectionChanged.emit,
             on_runtime_replaced=self._on_application_runtime_replaced,
             on_config_committed=self._on_application_config_committed,
             on_control_mode_changed=self._on_application_control_mode_changed,
@@ -144,6 +146,11 @@ class SLMQtSession(QtCore.QObject):
     @property
     def last_upload_error(self) -> Exception | None:
         return self._application.last_upload_error
+
+    @property
+    def application_session(self) -> SLMSession:
+        """Toolkit-independent session owned by this Qt adapter."""
+        return self._application
 
     @property
     def runtime(self) -> SLMRuntime:
@@ -316,6 +323,9 @@ class SLMQtSession(QtCore.QObject):
         self.sigInfo.connect(self.panel.show_info)
         self.sigStatusChanged.connect(self.panel.set_status)
         self.sigUploadFailed.connect(self._on_panel_upload_failed)
+        self.sigDeviceConnectionChanged.connect(
+            self._on_application_device_connection_changed,
+        )
         self.panel.config_controls.sigLoadRequested.connect(
             self._on_config_load_requested,
         )
@@ -330,6 +340,7 @@ class SLMQtSession(QtCore.QObject):
             (self.sigInfo,self.panel.show_info),
             (self.sigStatusChanged,self.panel.set_status),
             (self.sigUploadFailed,self._on_panel_upload_failed),
+            (self.sigDeviceConnectionChanged,self._on_application_device_connection_changed),
             (self.panel.config_controls.sigLoadRequested,self._on_config_load_requested),
         )
         for signal,slot in pairs:
@@ -343,6 +354,10 @@ class SLMQtSession(QtCore.QObject):
         self.panel.set_connection_control_visible(
             bool(device is not None and device.requires_explicit_connection)
         )
+
+    @QtCore.Slot(object)
+    def _on_application_device_connection_changed(self,result) -> None:
+        self.panel.set_connection_state(bool(result.connected))
 
     def initialize_device(self,*,show_error: bool=False):
         """Initialize the configured output device and publish the current frame."""
@@ -401,6 +416,28 @@ class SLMQtSession(QtCore.QObject):
             self.panel.set_connection_state(True)
             if show_error:
                 self._emit_exception("SLM disconnection failed",error)
+            return None
+        finally:
+            self.panel.set_connection_busy(False)
+
+    def reconnect_device(self,*,show_error: bool=True):
+        """Reconnect through the application session and restore its active frame."""
+        self._require_active()
+        device = self.host_services.device
+        if device is None:
+            raise RuntimeError("No SLM device provider is configured")
+        self.panel.set_connection_busy(True)
+        try:
+            result = self._application.reconnect_device()
+            if not result.connected and show_error:
+                self.sigError.emit(
+                    "SLM reconnection failed",
+                    result.message or "Could not reconnect the SLM device.",
+                )
+            return result
+        except Exception as error:
+            if show_error:
+                self._emit_exception("SLM reconnection failed",error)
             return None
         finally:
             self.panel.set_connection_busy(False)
@@ -691,6 +728,20 @@ class SLMQtSession(QtCore.QObject):
             self.clear_cgh_session(section_key)
         elif cgh_action is CghAction.OPEN_MEASUREMENTS_CORRECTIONS:
             self._feedback.open_window(section_key)
+        elif cgh_action is CghAction.FOV_CALIBRATION_SELECT:
+            self.feedback_service.select_fov_position_calibration(
+                section_key,values.get("name"),
+            )
+        elif cgh_action is CghAction.FOV_CALIBRATION_APPLY:
+            self.feedback_service.set_fov_position_calibration_applied(
+                section_key,bool(values.get("applied",False)),
+            )
+        elif cgh_action is CghAction.FOV_CALIBRATION_SET_DEFAULT:
+            self.feedback_service.set_default_fov_position_calibration(
+                section_key
+            )
+        elif cgh_action is CghAction.FOV_CALIBRATION_DELETE:
+            self.feedback_service.delete_fov_position_calibration(section_key)
 
     def _on_application_transition_committed(
         self,section_key: str,transition: SectionStateTransition,
@@ -909,6 +960,11 @@ class SLMQtSession(QtCore.QObject):
     def synchronize_section(self,section_key: str) -> None:
         status = self.runtime.get_section_feedback_status(section_key)
         self.section_collection.set_feedback_status(section_key,status)
+        self.section_collection.set_fov_position_calibration_context(
+            section_key,self.feedback_service.fov_position_calibration_context(
+                section_key
+            ),
+        )
         self.section_collection.set_cgh_target_presentation(
             section_key,self._main_cgh_presentation_summary(section_key),
         )
@@ -1056,6 +1112,16 @@ class SLMQtSession(QtCore.QObject):
 
     def prepare_section_layout_change(self,layout):
         return self._application.prepare_section_layout_change(layout)
+
+    def apply_section_topology(self, section_key, topologies):
+        return self._application.apply_section_topology(
+            section_key, topologies,
+        )
+
+    def set_section_presentation(self, section_key, presentation):
+        return self._application.set_section_presentation(
+            section_key, presentation,
+        )
 
     def apply_prepared_section_layout_change(
         self,
