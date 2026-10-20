@@ -16,8 +16,9 @@ from ...core.engine.section.update import SectionUpdate
 from ...core.engine.state.base import ParamPath
 from ...core.engine.state.groups import DynamicGroupState
 from ...core.engine.transition import SectionStateTransition
+from ...setup import FocusedEditingPreferences
 from .group_factory import DEFAULT_GROUP_VIEW_FACTORY,GroupViewFactory
-from .group_views import BaseGroupView,CghGroupView,GroupPresentationState
+from .group_views import BaseGroupView,CghAction,CghGroupView,GroupPresentationState
 from .policy import DEFAULT_RENDER_POLICY,RenderPolicy
 from .topology import SectionTopologyDialog
 
@@ -99,10 +100,7 @@ class SectionView(QtWidgets.QWidget):
 
     sigPatchRequested = QtCore.Signal(str,object)  # section_key, changes
     sigTopologyRequested = QtCore.Signal(str,object)  # section_key, topologies
-    sigActivePlaneRequested = QtCore.Signal(str,str)  # section_key, plane
-    sigAddPlaneRequested = QtCore.Signal(str)  # section_key
-    sigDeletePlaneRequested = QtCore.Signal(str,str)  # section_key, plane
-    sigDeleteCalibrationRequested = QtCore.Signal(str,str)  # section_key, plane
+    sigActiveMappingRequested = QtCore.Signal(str,str)  # section_key, mapping
     sigCalibrationRequested = QtCore.Signal(str)  # section_key
     sigCghActionRequested = QtCore.Signal(str,str,object)
     sigTargetLockRequested = QtCore.Signal(str,str,object)
@@ -134,10 +132,26 @@ class SectionView(QtWidgets.QWidget):
         self._revision = snapshot.revision
         self._cgh_computing = False
         self._feedback_status: Any = None
+        self._focused_editing = FocusedEditingPreferences()
+        self._focused_editing_enabled = False
 
         self.content_layout = QtWidgets.QVBoxLayout(self)
         self.content_layout.setContentsMargins(4,4,4,4)
         self.content_layout.setSpacing(6)
+
+        self.focused_editing_notice = QtWidgets.QLabel(
+            "Focused View — hidden settings remain active",self,
+        )
+        self.focused_editing_notice.setObjectName("SLMFocusedEditingNotice")
+        self.focused_editing_notice.setStyleSheet(
+            "QLabel { color: #a66a00; } QToolTip { color: white; }"
+        )
+        self.focused_editing_notice.setToolTip(
+            "This is a Focused View. Hidden settings are unchanged "
+            "and can still affect the output."
+        )
+        self.focused_editing_notice.hide()
+        self.content_layout.addWidget(self.focused_editing_notice,0)
 
         self._controls_row: QtWidgets.QHBoxLayout | None = None
         self.calibration_interface_widget: QtWidgets.QWidget | None = None
@@ -145,12 +159,10 @@ class SectionView(QtWidgets.QWidget):
         self.slm_unit_button: QtWidgets.QPushButton | None = None
         self.metric_unit_button: QtWidgets.QPushButton | None = None
         self.calibration_label: QtWidgets.QLabel | None = None
-        self.active_plane_combo: QtWidgets.QComboBox | None = None
-        self.calibration_button: QtWidgets.QPushButton | None = None
-        self.plane_more_button: QtWidgets.QToolButton | None = None
-        self.add_plane_action: QtWidgets.QAction | None = None
-        self.delete_plane_action: QtWidgets.QAction | None = None
-        self.delete_calibration_action: QtWidgets.QAction | None = None
+        self.active_mapping_combo: QtWidgets.QComboBox | None = None
+        self.fov_apply_checkbox: QtWidgets.QCheckBox | None = None
+        self._fov_mapping_context: dict[str,Any] = {}
+        self.mapping_manage_button: QtWidgets.QPushButton | None = None
         self.topology_settings_button: QtWidgets.QPushButton | None = None
         if (
             self.render_policy.show_unit_controls
@@ -172,6 +184,7 @@ class SectionView(QtWidgets.QWidget):
         self._refresh_calibration_controls()
         self._refresh_presentation_controls()
         self._refresh_topology_controls()
+        self._apply_focused_editing_presentation()
         self.apply_cgh_status(snapshot.cgh_status)
 
     @property
@@ -243,46 +256,42 @@ class SectionView(QtWidgets.QWidget):
             self.render_policy.show_calibration_controls
             and interface_layout is not None
         ):
-            interface_layout.addWidget(QtWidgets.QLabel("Plane:"))
+            interface_layout.addWidget(QtWidgets.QLabel("Mapping:"))
 
             combo = QtWidgets.QComboBox()
             combo.setMinimumWidth(130)
             combo.currentTextChanged.connect(
-                self._on_active_plane_changed,
+                self._on_active_mapping_changed,
             )
-            self.active_plane_combo = combo
+            self.active_mapping_combo = combo
             interface_layout.addWidget(combo)
 
-            calibrate = QtWidgets.QPushButton("Calibrate")
-            calibrate.setFixedHeight(22)
-            calibrate.clicked.connect(
+            fov_apply = QtWidgets.QCheckBox("FOV")
+            fov_apply.setToolTip(
+                "Apply the selected compatible FOV correction."
+            )
+            fov_apply.toggled.connect(
+                lambda checked:self.sigCghActionRequested.emit(
+                    self.section_key,CghAction.FOV_MAPPING_APPLY.value,
+                    {"applied":bool(checked)},
+                )
+            )
+            self.fov_apply_checkbox = fov_apply
+            interface_layout.addWidget(fov_apply)
+
+            manage = QtWidgets.QPushButton("Manage…")
+            manage.setFixedHeight(22)
+            manage.setToolTip(
+                "Manage mappings, base calibration and FOV corrections "
+                "for this section in SLM Workspace."
+            )
+            manage.clicked.connect(
                 lambda _checked=False:self.sigCalibrationRequested.emit(
                     self.section_key,
                 )
             )
-            self.calibration_button = calibrate
-            interface_layout.addWidget(calibrate)
-
-            more = QtWidgets.QToolButton()
-            more.setText("More")
-            more.setFixedHeight(22)
-            more.setPopupMode(QtWidgets.QToolButton.InstantPopup)
-            menu = QtWidgets.QMenu(more)
-            self.add_plane_action = menu.addAction(
-                "Add plane...",
-                lambda:self.sigAddPlaneRequested.emit(self.section_key),
-            )
-            self.delete_calibration_action = menu.addAction(
-                "Delete calibration...",
-                self._request_delete_calibration,
-            )
-            self.delete_plane_action = menu.addAction(
-                "Delete plane...",
-                self._request_delete_plane,
-            )
-            more.setMenu(menu)
-            self.plane_more_button = more
-            interface_layout.addWidget(more)
+            self.mapping_manage_button = manage
+            interface_layout.addWidget(manage)
 
         if self.calibration_interface_widget is not None:
             row.addWidget(self.calibration_interface_widget,1)
@@ -299,25 +308,11 @@ class SectionView(QtWidgets.QWidget):
 
         self.content_layout.addLayout(row)
 
-    def _on_active_plane_changed(self,plane_name: str) -> None:
+    def _on_active_mapping_changed(self,mapping_name: str) -> None:
         self._refresh_calibration_controls()
-        self.sigActivePlaneRequested.emit(
-            self.section_key,str(plane_name or ""),
+        self.sigActiveMappingRequested.emit(
+            self.section_key,str(mapping_name or ""),
         )
-
-    def _request_delete_calibration(self) -> None:
-        plane_name = self.get_active_plane()
-        if plane_name and _has_valid_calibration(self.calibration):
-            self.sigDeleteCalibrationRequested.emit(
-                self.section_key,plane_name,
-            )
-
-    def _request_delete_plane(self) -> None:
-        plane_name = self.get_active_plane()
-        if plane_name:
-            self.sigDeletePlaneRequested.emit(
-                self.section_key,plane_name,
-            )
 
     @property
     def has_editable_topology(self) -> bool:
@@ -387,6 +382,52 @@ class SectionView(QtWidgets.QWidget):
         self.sigPatchRequested.emit(
             self.section_key,full_changes,
         )
+
+    @property
+    def focused_editing_enabled(self) -> bool:
+        return self._focused_editing_enabled
+
+    @property
+    def focused_editing_selection(self) -> FocusedEditingPreferences:
+        return self._focused_editing
+
+    def set_focused_editing(
+        self,
+        selection: FocusedEditingPreferences | None,
+        *,
+        enabled: bool | None=None,
+    ) -> None:
+        """Apply the presentation-only Focused-editing projection."""
+        self._focused_editing = FocusedEditingPreferences.from_value(selection)
+        if enabled is not None:
+            self._focused_editing_enabled = bool(enabled) and self._focused_editing.configured
+        elif not self._focused_editing.configured:
+            self._focused_editing_enabled = False
+        self._apply_focused_editing_presentation()
+
+    def _apply_focused_editing_presentation(self) -> None:
+        focused = bool(
+            self._focused_editing_enabled and self._focused_editing.configured
+        )
+        self.focused_editing_notice.setVisible(focused)
+        for group_key,group_view in self.groups.items():
+            if group_key in self._focused_editing.items:
+                item_keys = group_view.available_focused_item_keys(
+                    self._focused_editing.item_keys(group_key)
+                )
+                selected = bool(item_keys)
+            else:
+                item_keys = None
+                selected = group_key in self._focused_editing.groups
+
+            if focused and selected:
+                group_view.set_focused_presentation(
+                    True,item_keys=item_keys,
+                )
+                group_view.widget.setVisible(True)
+            else:
+                group_view.set_focused_presentation(False)
+                group_view.widget.setVisible(not focused)
 
     def auto_recompute_enabled(self) -> bool:
         for group_view in self.groups.values():
@@ -496,6 +537,7 @@ class SectionView(QtWidgets.QWidget):
         self._refresh_calibration_controls()
         self._refresh_presentation_controls()
         self._refresh_topology_controls()
+        self._apply_focused_editing_presentation()
         self.apply_cgh_status(snapshot.cgh_status)
 
     def set_parameter(self,path: ParamPath,value: Any) -> bool:
@@ -537,6 +579,7 @@ class SectionView(QtWidgets.QWidget):
             self._index_group_entry(entry)
             self._refresh_unit_controls()
             self._refresh_presentation_controls()
+            self._apply_focused_editing_presentation()
             return
 
         replacement = self._create_group_view(entry)
@@ -554,6 +597,7 @@ class SectionView(QtWidgets.QWidget):
         self._index_group_entry(entry)
         self._refresh_unit_controls()
         self._refresh_presentation_controls()
+        self._apply_focused_editing_presentation()
 
     def _group_layout_position(
         self,snapshot: SLMSectionSnapshot,group_key: str,
@@ -606,27 +650,27 @@ class SectionView(QtWidgets.QWidget):
         self._refresh_calibration_controls()
         self._refresh_presentation_controls()
 
-    def set_available_planes(
-        self,plane_names,active_plane: str | None=None,
+    def set_available_mappings(
+        self,mapping_names,active_mapping: str | None=None,
     ) -> None:
-        """Set host-provided planes without emitting a selection request."""
-        combo = self.active_plane_combo
+        """Set host-provided mappings without emitting a selection request."""
+        combo = self.active_mapping_combo
         if combo is None:
             return
 
-        names = [str(name) for name in (plane_names or ())]
+        names = [str(name) for name in (mapping_names or ())]
         blocker = QtCore.QSignalBlocker(combo)
         try:
             combo.clear()
             combo.addItems(names)
-            index = combo.findText(str(active_plane)) if active_plane else -1
+            index = combo.findText(str(active_mapping)) if active_mapping else -1
             combo.setCurrentIndex(index)
         finally:
             del blocker
         self._refresh_calibration_controls()
 
-    def get_active_plane(self) -> str | None:
-        combo = self.active_plane_combo
+    def get_active_mapping(self) -> str | None:
+        combo = self.active_mapping_combo
         if combo is None or combo.currentIndex() < 0:
             return None
         return combo.currentText().strip() or None
@@ -700,7 +744,7 @@ class SectionView(QtWidgets.QWidget):
     def _refresh_calibration_controls(self) -> None:
         label = self.calibration_label
         valid = _has_valid_calibration(self.calibration)
-        plane = self.get_active_plane()
+        mapping = self.get_active_mapping()
 
         if label is not None:
             if valid:
@@ -720,21 +764,15 @@ class SectionView(QtWidgets.QWidget):
                         geometry_matches=matches,
                     )
                 )
-            elif plane:
+            elif mapping:
                 label.setText("Not calibrated")
                 label.setStyleSheet("color: #888;")
                 label.setToolTip("")
             else:
-                label.setText("No plane selected")
+                label.setText("No mapping selected")
                 label.setStyleSheet("color: #888;")
                 label.setToolTip("")
 
-        if self.calibration_button is not None:
-            self.calibration_button.setEnabled(bool(plane))
-        if self.delete_calibration_action is not None:
-            self.delete_calibration_action.setEnabled(bool(plane) and valid)
-        if self.delete_plane_action is not None:
-            self.delete_plane_action.setEnabled(bool(plane))
 
     def set_cgh_target_presentation(
         self,summary: Mapping[str,Any],
@@ -760,12 +798,41 @@ class SectionView(QtWidgets.QWidget):
             if isinstance(group_view,CghGroupView):
                 group_view.apply_feedback_status(status)
 
-    def set_fov_position_calibration_context(
+    def set_fov_mapping_correction_context(
         self,context: Mapping[str,Any] | None,
     ) -> None:
-        for group_view in self.groups.values():
-            if isinstance(group_view,CghGroupView):
-                group_view.set_fov_position_calibration_context(context)
+        self._fov_mapping_context = dict(context or {})
+        checkbox = self.fov_apply_checkbox
+        if checkbox is None:
+            return
+        ctx = self._fov_mapping_context
+        compatible = bool(ctx.get("selected_compatible",False))
+        supported = bool(ctx.get("supported",False))
+        blocker = QtCore.QSignalBlocker(checkbox)
+        try:
+            checkbox.setChecked(bool(ctx.get("applied",False)))
+        finally:
+            del blocker
+        enabled = bool(ctx.get("mapping_name")) and compatible and supported
+        checkbox.setEnabled(enabled)
+        reason = str(ctx.get("compatibility_reason") or "").strip()
+        if not supported:
+            reason = "The current target does not support FOV mapping correction."
+        extrapolated = int(ctx.get("extrapolated_count",0) or 0)
+        target_count = int(ctx.get("target_count",0) or 0)
+        if extrapolated:
+            detail = (
+                "Applying the default FOV correction extrapolates %d of %d "
+                "current target positions outside measured coverage."
+                % (extrapolated,target_count)
+            )
+            reason = (reason + "\n" + detail).strip() if reason else detail
+        checkbox.setStyleSheet(
+            "QCheckBox { color: #a66a00; }" if extrapolated else ""
+        )
+        checkbox.setToolTip(
+            reason or "Apply the selected compatible FOV correction."
+        )
 
     def set_snapshot(self,snapshot: SLMSectionSnapshot) -> None:
         calibration_changed = (

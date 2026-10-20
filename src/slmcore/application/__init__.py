@@ -1,5 +1,6 @@
+from .addressing import SLMSectionAddress
 from .calibration import (
-    CalibrationAcquisitionAvailability,PreparedPlaneSelection,
+    CalibrationAcquisitionAvailability,PreparedMappingSelection,
     SLMCalibrationCallbacks,SLMCalibrationService,TargetCalibrationState,
 )
 from .configuration import (
@@ -7,10 +8,26 @@ from .configuration import (
     CorrectionMismatchPolicy,PreparedConfigLoad,SLMConfigurationService,StartupRuntime,
 )
 from .control_mode import SLMControlMode
+from .fov_calibration import FOVCalibrationService,FOVCalibrationState
+from .fov_mapping_runtime import (
+    FOVMappingRuntimeContext,FOVMappingRuntimePreview,FOVMappingRuntimeService,
+)
+from .geometry_calibration import (
+    GeometryCalibrationContext,GeometryCalibrationPayload,GeometryCalibrationService,
+)
 from .feedback import (
     AutomaticFeedbackRunner,AutomaticFeedbackState,FeedbackParameterUpdateResult,
     MeasurementDispatcher,MeasurementRequest,PositionReferenceContext,
-    PositionReferenceSelection,SLMFeedbackCallbacks,SLMFeedbackService,
+    PositionCorrectionSelection,PositionReferenceSelection,PositionReferenceSourceSelection,SLMFeedbackCallbacks,SLMFeedbackService,
+)
+from .mapping import MappingService
+from .observation import ObservationPlaneService
+from .observation_geometry import ObservationGeometryService
+from .observation_registration import ObservationRegistrationService
+from .observation_registration_calibration import (
+    ObservationRegistrationCalibrationContext,ObservationRegistrationCalibrationService,
+    ObservationRegistrationFitDiagnostics,
+    ObservationRegistrationLocalizationSnapshot,ObservationRegistrationReferenceSnapshot,
 )
 from .runtime_factory import SLMRuntimeFactory
 from .section_layout import PreparedSectionLayoutChange,SLMSectionLayoutService
@@ -26,13 +43,30 @@ __all__ = [
     "CorrectionMismatch",
     "CorrectionMismatchPolicy",
     "FeedbackParameterUpdateResult",
+    "FOVCalibrationService",
+    "FOVCalibrationState",
+    "FOVMappingRuntimeContext",
+    "FOVMappingRuntimePreview",
+    "FOVMappingRuntimeService",
+    "GeometryCalibrationContext",
+    "GeometryCalibrationPayload",
+    "GeometryCalibrationService",
     "MeasurementDispatcher",
     "MeasurementRequest",
+    "MappingService",
+    "ObservationGeometryService",
+    "ObservationRegistrationService",
+    "ObservationRegistrationCalibrationContext",
+    "ObservationRegistrationCalibrationService",
+    "ObservationRegistrationFitDiagnostics",
+    "ObservationRegistrationLocalizationSnapshot","ObservationRegistrationReferenceSnapshot",
+    "ObservationPlaneService",
     "PreparedConfigLoad",
-    "PreparedPlaneSelection",
+    "PreparedMappingSelection",
     "PreparedSectionLayoutChange",
     "PositionReferenceContext",
-    "PositionReferenceSelection",
+    "PositionCorrectionSelection","PositionReferenceSelection",
+    "PositionReferenceSourceSelection",
     "SLMCalibrationCallbacks",
     "SLMCalibrationService",
     "SLMConfigurationService",
@@ -40,6 +74,7 @@ __all__ = [
     "SLMFeedbackCallbacks",
     "SLMFeedbackService",
     "SLMRuntimeFactory",
+    "SLMSectionAddress",
     "SLMSectionLayoutService",
     "SLMSession",
     "SLMSessionCallbacks",

@@ -7,9 +7,12 @@ from ..core.engine.registry import SLMRegistries
 from .calibration_store import SLMCalibrationStore
 from .config_store import SLMConfigStore
 from .correction_store import SLMCorrectionStore
-from .position_reference_store import SLMPositionReferenceStore
-from .fov_position_calibration_store import SLMFOVPositionCalibrationStore
+from .fov_mapping_correction_store import FOVMappingCorrectionStore
 from .geometry_orientation_calibration_store import SLMGeometryOrientationCalibrationStore
+from .mapping_store import MappingStore
+from .observation_plane_store import ObservationPlaneStore
+from .observation_registration_store import ObservationRegistrationStore
+from .position_reference_store import PositionReferenceStore
 
 
 class SLMWorkspace:
@@ -23,8 +26,11 @@ class SLMWorkspace:
         corrections_dir: str | Path | None=None,
         calibrations_dir: str | Path | None=None,
         position_references_dir: str | Path | None=None,
-        fov_position_calibrations_dir: str | Path | None=None,
+        fov_mapping_corrections_dir: str | Path | None=None,
         geometry_orientation_calibrations_dir: str | Path | None=None,
+        observation_planes_dir: str | Path | None=None,
+        observation_registration_calibrations_dir: str | Path | None=None,
+        mappings_dir: str | Path | None=None,
     ) -> None:
         self.root = Path(root).expanduser().resolve()
         self.root.mkdir(parents=True,exist_ok=True)
@@ -34,18 +40,26 @@ class SLMWorkspace:
         self.position_references_root = self._resolve_override(
             position_references_dir,"position_references"
         )
-        self.fov_position_calibrations_root = self._resolve_override(
-            fov_position_calibrations_dir,"fov_position_calibrations"
+        self.fov_mapping_corrections_root = self._resolve_override(
+            fov_mapping_corrections_dir,"fov_mapping_corrections"
         )
         self.geometry_orientation_calibrations_root = self._resolve_override(
             geometry_orientation_calibrations_dir,"geometry_orientation_calibrations"
         )
+        self.observation_planes_root = self._resolve_override(observation_planes_dir,".")
+        self.observation_registration_calibrations_root = self._resolve_override(
+            observation_registration_calibrations_dir,"observation_registration_calibrations"
+        )
+        self.mappings_root = self._resolve_override(mappings_dir,".")
         self._config_stores: dict[tuple[str,int],SLMConfigStore] = {}
         self._correction_stores: dict[tuple[str,str],SLMCorrectionStore] = {}
         self._calibration_store: SLMCalibrationStore | None = None
-        self._position_reference_store: SLMPositionReferenceStore | None = None
-        self._fov_position_calibration_store: SLMFOVPositionCalibrationStore | None = None
+        self._fov_mapping_correction_store: FOVMappingCorrectionStore | None = None
         self._geometry_orientation_calibration_store: SLMGeometryOrientationCalibrationStore | None = None
+        self._observation_plane_store: ObservationPlaneStore | None = None
+        self._observation_registration_store: ObservationRegistrationStore | None = None
+        self._position_reference_store: PositionReferenceStore | None = None
+        self._mapping_store: MappingStore | None = None
 
     @property
     def calibration_store(self) -> SLMCalibrationStore:
@@ -53,21 +67,42 @@ class SLMWorkspace:
             self._calibration_store = SLMCalibrationStore(self.calibrations_root)
         return self._calibration_store
 
+
     @property
-    def position_reference_store(self) -> SLMPositionReferenceStore:
+    def mapping_store(self) -> MappingStore:
+        if self._mapping_store is None:
+            self._mapping_store = MappingStore(self.mappings_root)
+        return self._mapping_store
+
+    @property
+    def fov_mapping_correction_store(self) -> FOVMappingCorrectionStore:
+        if self._fov_mapping_correction_store is None:
+            self._fov_mapping_correction_store = FOVMappingCorrectionStore(
+                self.fov_mapping_corrections_root
+            )
+        return self._fov_mapping_correction_store
+
+    @property
+    def observation_plane_store(self) -> ObservationPlaneStore:
+        if self._observation_plane_store is None:
+            self._observation_plane_store = ObservationPlaneStore(self.observation_planes_root)
+        return self._observation_plane_store
+
+    @property
+    def position_reference_store(self) -> PositionReferenceStore:
         if self._position_reference_store is None:
-            self._position_reference_store = SLMPositionReferenceStore(
+            self._position_reference_store = PositionReferenceStore(
                 self.position_references_root
             )
         return self._position_reference_store
 
     @property
-    def fov_position_calibration_store(self) -> SLMFOVPositionCalibrationStore:
-        if self._fov_position_calibration_store is None:
-            self._fov_position_calibration_store = SLMFOVPositionCalibrationStore(
-                self.fov_position_calibrations_root
+    def observation_registration_store(self) -> ObservationRegistrationStore:
+        if self._observation_registration_store is None:
+            self._observation_registration_store = ObservationRegistrationStore(
+                self.observation_registration_calibrations_root
             )
-        return self._fov_position_calibration_store
+        return self._observation_registration_store
 
     @property
     def geometry_orientation_calibration_store(self) -> SLMGeometryOrientationCalibrationStore:

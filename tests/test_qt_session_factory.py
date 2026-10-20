@@ -253,9 +253,74 @@ def test_slmcore_qt_top_level_is_strict_host_facing_api():
         "SLMQtSession",
         "SLMQtSessionFactory",
         "SLMQtSessionGroup",
+        "SLMWorkspaceCoordinator",
         "SLMControlMode",
         "SLMControlModeSelector",
     }
     assert not hasattr(qt,"ParamForm")
     assert not hasattr(qt,"SectionsCollectionView")
     assert not hasattr(qt,"SLMRuntimeViewBinding")
+
+
+def test_session_factory_shares_one_live_position_reference_store(tmp_path):
+    _app()
+    from slmcore.qt import SLMQtSessionFactory
+
+    workspace = SLMWorkspace(tmp_path)
+    factory = SLMQtSessionFactory(workspace=workspace)
+    first,first_panel = factory.create(
+        definition=_setup(),
+        on_startup_preferences_changed=_discard,
+    )
+    second,second_panel = factory.create(
+        definition=_setup(),
+        on_startup_preferences_changed=_discard,
+    )
+    try:
+        assert factory.position_reference_store is workspace.position_reference_store
+        assert first.feedback_service._position_reference_store is (
+            workspace.position_reference_store
+        )
+        assert second.feedback_service._position_reference_store is (
+            workspace.position_reference_store
+        )
+    finally:
+        first.dispose()
+        second.dispose()
+        first_panel.deleteLater()
+        second_panel.deleteLater()
+
+
+def test_factories_with_same_workspace_share_live_position_reference_store(tmp_path):
+    _app()
+    from slmcore.qt import SLMQtSessionFactory
+
+    workspace = SLMWorkspace(tmp_path)
+    first_factory = SLMQtSessionFactory(workspace=workspace)
+    second_factory = SLMQtSessionFactory(workspace=workspace)
+
+    assert first_factory.position_reference_store is workspace.position_reference_store
+    assert second_factory.position_reference_store is workspace.position_reference_store
+    assert first_factory.position_reference_store is second_factory.position_reference_store
+
+
+def test_workspace_less_factory_keeps_one_private_live_reference_store():
+    _app()
+    from slmcore.qt import SLMQtSessionFactory
+
+    factory = SLMQtSessionFactory()
+    first,first_panel = factory.create(
+        definition=_setup(),on_startup_preferences_changed=_discard,
+    )
+    second,second_panel = factory.create(
+        definition=_setup(),on_startup_preferences_changed=_discard,
+    )
+    try:
+        store=factory.position_reference_store
+        assert store is factory.position_reference_store
+        assert not store.persistence_available
+        assert first.feedback_service._position_reference_store is store
+        assert second.feedback_service._position_reference_store is store
+    finally:
+        first.dispose(); second.dispose()
+        first_panel.deleteLater(); second_panel.deleteLater()

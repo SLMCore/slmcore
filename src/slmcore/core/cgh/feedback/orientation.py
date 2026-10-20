@@ -6,6 +6,8 @@ from enum import Enum
 
 import numpy as np
 
+from ..lattice_geometry import LatticeRepresentation
+from ..lattice_mapping import lattice_transform_matrix
 from ..localization import LocalizationResult
 
 
@@ -39,42 +41,137 @@ class FeedbackOrientation(str,Enum):
         return cls(aliases.get(text,text))
 
 
+def _localization_lattice_representation(
+    localization: LocalizationResult,
+) -> LatticeRepresentation | None:
+    """Return finite lattice topology paired with localization columns when known."""
+    diagnostics=dict(localization.diagnostics or {})
+    payload=diagnostics.get("lattice_representation")
+    if payload is not None:
+        try:
+            lattice=LatticeRepresentation.from_mapping(payload)
+            if np.array_equal(lattice.lattice_indices,localization.lattice_indices):
+                return lattice
+        except (KeyError,TypeError,ValueError):
+            pass
+
+    stagger=diagnostics.get("resolved_stagger")
+    if stagger is None:
+        stagger=dict(localization.target_params or {}).get("stagger")
+    if stagger is None:
+        return None
+    try:
+        return LatticeRepresentation.alternating_rows(
+            localization.lattice_indices,float(stagger),
+        )
+    except (TypeError,ValueError):
+        return None
+
+
+def _target_lattice_representation(
+    localization: LocalizationResult,
+) -> LatticeRepresentation | None:
+    """Return the authoritative target topology captured by the localization."""
+    try:
+        from ..targets.lattice import LatticeDefinition
+        lattice=LatticeDefinition.from_params(localization.target_params).lattice_representation()
+        if np.array_equal(lattice.lattice_indices,localization.lattice_indices):
+            return lattice
+    except (KeyError,TypeError,ValueError):
+        pass
+    return _localization_lattice_representation(localization)
+
+
+
+def orient_lattice_representation(
+    lattice: LatticeRepresentation,
+    permutation: np.ndarray,
+    orientation: FeedbackOrientation | str,
+) -> LatticeRepresentation:
+    """Reindex finite topology in lockstep with oriented detector positions.
+
+    Feedback orientation changes which camera-localized point belongs to each
+    stable target lattice identity.  For motif lattices (notably staggered rows),
+    permuting only detector arrays leaves the topology attached to the wrong
+    columns and creates alternating-row edge errors.
+    """
+    if not isinstance(lattice,LatticeRepresentation):
+        raise TypeError("lattice must be a LatticeRepresentation")
+    permutation=np.asarray(permutation,dtype=np.int64)
+    if permutation.shape!=(lattice.lattice_indices.shape[1],):
+        raise ValueError("Lattice orientation permutation has the wrong size")
+    diagnostics=dict(lattice.diagnostics or {})
+    diagnostics["feedback_orientation"]=FeedbackOrientation.normalize(orientation).value
+    diagnostics["feedback_orientation_applied"]=True
+    return LatticeRepresentation(
+        lattice_indices=lattice.lattice_indices,
+        cell_indices=np.asarray(lattice.cell_indices)[:,permutation],
+        basis_indices=np.asarray(lattice.basis_indices)[permutation],
+        cell_vectors=lattice.cell_vectors,
+        basis_offsets=lattice.basis_offsets,
+        diagnostics=diagnostics,
+    )
+
+
 def orient_localization(
     localization: LocalizationResult,
     orientation: FeedbackOrientation | str,
+    *,
+    target_lattice: LatticeRepresentation | None=None,
 ) -> LocalizationResult:
-    """Return target-indexed localization for one discrete camera orientation.
+    """Return localization arrays in authoritative target-site order.
 
-    The acquired/cropped image itself is deliberately left untouched.  Only the
-    correspondence between logical target indices and localized camera points is
-    permuted.  This is equivalent to rotating/flipping the camera image before
-    localization, while preserving native camera coordinates for display.
+    Localization records any residual D4 detector frame once.  Feedback composes
+    that explicit frame with the configured camera->target orientation and applies
+    one rectangular identity permutation.  No motif/phase matching occurs here;
+    motif correspondence belongs to reference resolution after both sides are
+    target-indexed.
     """
     if not isinstance(localization,LocalizationResult):
         raise TypeError("localization must be a LocalizationResult")
-    orientation = FeedbackOrientation.normalize(orientation)
-    if orientation is FeedbackOrientation.IDENTITY:
+    orientation=FeedbackOrientation.normalize(orientation)
+    if target_lattice is None:
+        target_lattice=_target_lattice_representation(localization)
+
+    diagnostics=dict(localization.diagnostics or {})
+    source_frame=str(diagnostics.get("spot_ordering_detector_frame","canonical"))
+    combined=(
+        lattice_transform_matrix(orientation.value)
+        @ lattice_transform_matrix(source_frame)
+    )
+    matrix_to_orientation={
+        tuple(lattice_transform_matrix(value.value).ravel()):value
+        for value in FeedbackOrientation
+    }
+    effective=matrix_to_orientation.get(tuple(combined.ravel()))
+    if effective is None:
+        raise RuntimeError("Unsupported composed feedback orientation")
+    permutation=orientation_permutation(localization.lattice_indices,effective)
+
+    if effective is FeedbackOrientation.IDENTITY and target_lattice is None:
         return localization
 
-    permutation = orientation_permutation(
-        localization.lattice_indices,orientation,
-    )
-    diagnostics = dict(localization.diagnostics or {})
+    if target_lattice is not None:
+        diagnostics["lattice_representation"]=target_lattice.to_dict()
+    diagnostics["feedback_source_detector_frame"]=source_frame
+    diagnostics["feedback_effective_orientation"]=effective.value
+    diagnostics["feedback_orientation_topology_aware"]=False
     for key in ("matched_mask","inferred_mask","detection_indices"):
-        value = diagnostics.get(key)
+        value=diagnostics.get(key)
         if value is not None:
-            array = np.asarray(value)
-            if array.shape == (permutation.size,):
-                diagnostics[key] = tuple(array[permutation].tolist())
-    residuals = diagnostics.get("residuals_px")
+            array=np.asarray(value)
+            if array.shape==(permutation.size,):
+                diagnostics[key]=tuple(array[permutation].tolist())
+    residuals=diagnostics.get("residuals_px")
     if residuals is not None:
-        array = np.asarray(residuals,dtype=np.float64)
-        if array.shape == localization.expected_positions_px.shape:
-            diagnostics["residuals_px"] = tuple(
+        array=np.asarray(residuals,dtype=np.float64)
+        if array.shape==localization.expected_positions_px.shape:
+            diagnostics["residuals_px"]=tuple(
                 tuple(float(item) for item in row)
                 for row in array[:,permutation]
             )
-    diagnostics["feedback_orientation"] = orientation.value
+    diagnostics["feedback_orientation"]=orientation.value
+    diagnostics["feedback_target_indexed"]=True
 
     return LocalizationResult(
         target_type=localization.target_type,
@@ -150,8 +247,32 @@ def orientation_permutation(
     return np.asarray(transformed,dtype=np.int64).ravel()
 
 
+def orientation_reindex_permutation(
+    lattice_indices: np.ndarray,
+    source_orientation: FeedbackOrientation | str,
+    target_orientation: FeedbackOrientation | str,
+) -> np.ndarray:
+    """Reindex source-oriented columns into target-oriented logical order.
+
+    ``orient_localization`` stores detector positions in the logical order for
+    one section's feedback orientation.  A saved reference may later be used by
+    a section with a different feedback orientation.  This permutation maps
+    values that are already in ``source_orientation`` order into the order
+    expected by ``target_orientation`` without changing detector coordinates.
+    """
+    source = orientation_permutation(lattice_indices,source_orientation)
+    target = orientation_permutation(lattice_indices,target_orientation)
+    if source.size != target.size:  # pragma: no cover - same lattice by construction.
+        raise ValueError("Feedback orientation permutations have different sizes")
+    inverse_source = np.empty_like(source)
+    inverse_source[source] = np.arange(source.size,dtype=np.int64)
+    return inverse_source[target]
+
+
 __all__ = [
     "FeedbackOrientation",
     "orient_localization",
     "orientation_permutation",
+    "orientation_reindex_permutation",
+    "orient_lattice_representation",
 ]

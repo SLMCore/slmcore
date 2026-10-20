@@ -63,6 +63,13 @@ class ParamField(QtWidgets.QWidget):
 
         self.label = QtWidgets.QLabel()
         self.editor = self._create_editor(editor_width)
+        if isinstance(
+            self.editor,(QtWidgets.QSpinBox,QtWidgets.QDoubleSpinBox),
+        ):
+            # Free-form numeric typing is provisional until the editor is
+            # finished. Discrete arrow/key/wheel stepping still commits live
+            # through the spinbox valueChanged signal.
+            self._commit_mode = ParameterCommitMode.EDIT_FINISHED
         self.complementaryLabel = QtWidgets.QLabel()
         self.complementaryLabel.setStyleSheet("color: #888;")
         self.complementaryLabel.setVisible(self._show_complementary)
@@ -588,6 +595,7 @@ class ParamForm(QtCore.QObject):
 
         self._advanced_expanded = False
         self._advanced_toggle: QtWidgets.QToolButton | None = None
+        self._presentation_visible = True
 
         for key,definition in self._definitions.items():
             if not isinstance(key,str) or not key:
@@ -668,6 +676,20 @@ class ParamForm(QtCore.QObject):
     def canonical_definitions(self) -> Iterable[ParamSpec]:
         return iter(self._definitions.values())
 
+    def set_presentation_visible(self,visible: bool) -> None:
+        """Show/hide this complete form without changing bound values."""
+        self._presentation_visible = bool(visible)
+        for field in self._fields.values():
+            is_advanced = (
+                field.definition.display_level == ParamDisplayLevel.ADVANCED
+            )
+            field.set_presentation_visible(
+                self._presentation_visible
+                and (not is_advanced or self._advanced_expanded)
+            )
+        if self._advanced_toggle is not None:
+            self._advanced_toggle.setVisible(self._presentation_visible)
+
     def set_advanced_expanded(self,expanded: bool) -> None:
         expanded = bool(expanded)
         self._advanced_expanded = expanded
@@ -695,7 +717,9 @@ class ParamForm(QtCore.QObject):
             )
 
         for field in self._advanced_fields():
-            field.set_presentation_visible(expanded)
+            field.set_presentation_visible(
+                self._presentation_visible and expanded
+            )
 
         if (
             button is not None
@@ -871,6 +895,7 @@ class ParamForm(QtCore.QObject):
                 fields_in_row = 0
 
             button = self._ensure_advanced_toggle(layout.parentWidget())
+            button.setVisible(self._presentation_visible)
             layout.addWidget(
                 button,row,column,1,1,
                 alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter

@@ -81,6 +81,34 @@ class LatticeRepresentation:
         object.__setattr__(self,"basis_offsets",offsets)
         object.__setattr__(self,"diagnostics",_freeze_mapping(self.diagnostics))
 
+
+    def to_dict(self):
+        """Return a JSON-serializable representation of this finite lattice."""
+        return {
+            "lattice_indices":self.lattice_indices.tolist(),
+            "cell_indices":self.cell_indices.tolist(),
+            "basis_indices":self.basis_indices.tolist(),
+            "cell_vectors":self.cell_vectors.tolist(),
+            "basis_offsets":self.basis_offsets.tolist(),
+            "diagnostics":deepcopy(dict(self.diagnostics)),
+        }
+
+    @classmethod
+    def from_mapping(cls,value):
+        """Restore a :class:`LatticeRepresentation` from ``to_dict()`` data."""
+        if isinstance(value,cls):
+            return value
+        if not isinstance(value,Mapping):
+            raise TypeError("Lattice representation data must be a mapping")
+        return cls(
+            lattice_indices=np.asarray(value["lattice_indices"]),
+            cell_indices=np.asarray(value["cell_indices"]),
+            basis_indices=np.asarray(value["basis_indices"],dtype=np.int64),
+            cell_vectors=np.asarray(value["cell_vectors"],dtype=np.float64),
+            basis_offsets=np.asarray(value["basis_offsets"],dtype=np.float64),
+            diagnostics=value.get("diagnostics",{}),
+        )
+
     @property
     def logical_positions(self):
         """Return uncentered logical positions with shape ``(2, N)``."""
@@ -103,10 +131,10 @@ class LatticeRepresentation:
     def alternating_rows(cls,lattice_indices,stagger):
         """Build the canonical two-row representation used by SLM lattices.
 
-        The public stagger remains in ``[0, 1]``.  Internally the odd-row motif
-        is canonicalized to a signed X offset in ``[-0.5, 0.5]``.  When the
-        public value is above 0.5, an integer +X cell shift on odd rows exactly
-        preserves every finite target position and its stable lattice index.
+        The public stagger is signed in ``[-1, 1]``.  Internally the odd-row
+        motif is canonicalized to a signed X offset in ``[-0.5, 0.5]``.  Values
+        outside that canonical interval use an integer X cell shift on odd rows
+        so every finite target position and stable lattice index is preserved.
         """
         indices = np.asarray(lattice_indices)
         if indices.ndim != 2 or indices.shape[0] != 2 or indices.shape[1] == 0:
@@ -116,12 +144,15 @@ class LatticeRepresentation:
             raise ValueError("alternating-row lattice indices must be integers")
 
         value = float(stagger)
-        if not np.isfinite(value) or not 0.0 <= value <= 1.0:
-            raise ValueError("stagger must be finite and in [0, 1]")
+        if not np.isfinite(value) or not -1.0 <= value <= 1.0:
+            raise ValueError("stagger must be finite and in [-1, 1]")
 
         if value > 0.5:
             canonical = value - 1.0
             odd_x_cell_shift = 1
+        elif value < -0.5:
+            canonical = value + 1.0
+            odd_x_cell_shift = -1
         else:
             canonical = value
             odd_x_cell_shift = 0

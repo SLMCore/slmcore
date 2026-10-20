@@ -10,6 +10,10 @@ from qtpy import QtCore,QtWidgets
 
 from ...core.engine.parameters.converters import METRIC_UNIT,SLM_UNIT
 from ...core.engine.registry import TargetPresentation,TargetPresentationFieldKind
+from ...core.transform2d import (
+    FittedTransform2D,TRANSFORM_AFFINE,TRANSFORM_POLYNOMIAL,TRANSFORM_RIGID,
+    TRANSFORM_TRANSLATION,fit_transform2d,
+)
 
 
 _MUTED_COLOR = "#888"
@@ -577,18 +581,48 @@ class InspectView(QtWidgets.QWidget):
 
 
 class PositionReferenceView(QtWidgets.QWidget):
-    """Detector-image overlay for measured, fitted and selected reference lattices."""
+    """Detector-space Current / Reference / Predicted alignment workbench."""
+
+    LIVE_PREVIEW_INTERVAL_MS = 100
 
     sigCenterOffsetRequested = QtCore.Signal(float,float)
+    sigManualTransformRequested = QtCore.Signal(object)
 
     def __init__(self,parent: QtWidgets.QWidget | None=None) -> None:
         super().__init__(parent)
         self._preview = None
+        self._measurement_id = None
         self._reference_positions = None
+        self._raw_reference_positions = None
         self._measured_positions = None
+        self._global_positions = None
         self._fit_center = None
         self._reference_center = None
+        self._crop_offset_px = np.zeros(2,dtype=np.float64)
         self._updating_center = False
+        self._interactive_editable = False
+        self._interactive_model: str | None = None
+        self._fitted_transform: FittedTransform2D | None = None
+
+        self._matrix_editor_updating = False
+        self._matrix_source_anchors = None
+        self._matrix_source_corners = None
+        self._matrix_last_origin = None
+
+        self._polynomial_updating = False
+        self._polynomial_source_handles = None
+        self._polynomial_grid_shape = None
+        self._polynomial_degree = 2
+        self._polynomial_handles: list[pg.TargetItem] = []
+
+        # Interactive transforms may emit many mouse-move events.  Keep the
+        # handles themselves responsive, but coalesce the heavier scatter/vector
+        # redraw path to 10 Hz.
+        self._display_predicted_positions = None
+        self._live_preview_timer = QtCore.QTimer(self)
+        self._live_preview_timer.setSingleShot(True)
+        self._live_preview_timer.setInterval(self.LIVE_PREVIEW_INTERVAL_MS)
+        self._live_preview_timer.timeout.connect(self._flush_interactive_live_preview)
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0,0,0,0)
@@ -608,34 +642,130 @@ class PositionReferenceView(QtWidgets.QWidget):
         self.measured_item = pg.ScatterPlotItem(
             symbol="x",size=9,pen=pg.mkPen("#55aa55",width=1.6),
         )
+        # Historical names are retained internally: reference_item is Predicted;
+        # raw_reference_item is the actual selected Reference geometry.
         self.reference_item = pg.ScatterPlotItem(
-            symbol="+",size=12,pen=pg.mkPen("#e06cdb",width=1.8),
+            symbol="+",size=12,pen=pg.mkPen("#55c7d9",width=1.8),
+        )
+        self.raw_reference_item = pg.ScatterPlotItem(
+            symbol="o",size=10,pen=pg.mkPen("#e06cdb",width=1.3),brush=None,
         )
         self.vector_item = pg.PlotCurveItem(
             pen=pg.mkPen("#ff9966",width=1.1),
         )
-        self.center_item = pg.TargetItem(
-            movable=True,size=16,
-            pen=pg.mkPen("#e06cdb",width=1.4),
+        self.residual_item = pg.PlotCurveItem(
+            pen=pg.mkPen("#cc6666",width=1.1),
         )
+        self.center_item = pg.TargetItem(
+            movable=True,size=16,pen=pg.mkPen("#e06cdb",width=1.4),
+        )
+
+        # Affine editor: a cage plus center/x-axis/y-axis handles. The center
+        # translates the complete transform; the axis handles control the two
+        # matrix-backed transform basis vectors without exposing coefficients.
+        self.matrix_frame_item = pg.PlotCurveItem(
+            pen=pg.mkPen("#ffcc66",width=1.5),
+        )
+        self.matrix_origin_item = pg.TargetItem(
+            movable=True,size=14,pen=pg.mkPen("#ffcc66",width=1.5),
+        )
+        self.matrix_x_item = pg.TargetItem(
+            movable=True,size=11,pen=pg.mkPen("#ffcc66",width=1.4),
+        )
+        self.matrix_y_item = pg.TargetItem(
+            movable=True,size=11,pen=pg.mkPen("#ffcc66",width=1.4),
+        )
+        self.polynomial_mesh_item = pg.PlotCurveItem(
+            pen=pg.mkPen("#ffcc66",width=1.0),
+        )
+
         for item in (
-            self.image_item,self.global_item,self.vector_item,
-            self.measured_item,self.reference_item,self.center_item,
+            self.image_item,self.global_item,self.vector_item,self.residual_item,
+            self.measured_item,self.raw_reference_item,self.reference_item,
+            self.matrix_frame_item,self.polynomial_mesh_item,self.center_item,
+            self.matrix_origin_item,self.matrix_x_item,self.matrix_y_item,
         ):
             self.view_box.addItem(item)
         self.center_item.setVisible(False)
+        for item in (
+            self.matrix_frame_item,self.matrix_origin_item,self.matrix_x_item,
+            self.matrix_y_item,self.polynomial_mesh_item,
+        ):
+            item.setVisible(False)
+
         self.center_item.sigPositionChanged.connect(self._on_center_position_changed)
-        self.center_item.sigPositionChangeFinished.connect(self._on_center_position_finished)
+        self.center_item.sigPositionChangeFinished.connect(
+            self._on_center_position_finished
+        )
+        self.matrix_origin_item.sigPositionChanged.connect(
+            self._on_matrix_origin_changed
+        )
+        self.matrix_x_item.sigPositionChanged.connect(self._on_matrix_axis_changed)
+        self.matrix_y_item.sigPositionChanged.connect(self._on_matrix_axis_changed)
+        for item in (
+            self.matrix_origin_item,self.matrix_x_item,self.matrix_y_item,
+        ):
+            item.sigPositionChangeFinished.connect(self._on_matrix_edit_finished)
         layout.addWidget(self.graphics,1)
 
-        footer = QtWidgets.QHBoxLayout()
-        footer.setContentsMargins(0,2,0,0)
-        footer.setSpacing(8)
-        legend = QtWidgets.QLabel(
-            "Measured ×   Global fit +   Reference +   Vector: measured → reference"
+        overlay_row = QtWidgets.QHBoxLayout()
+        overlay_row.setContentsMargins(0,2,0,0)
+        overlay_row.setSpacing(8)
+        # Match the localization workbench convention: the checkbox text itself
+        # doubles as a compact legend using the exact symbol/color shown in the
+        # detector overlay.
+        self.current_checkbox = QtWidgets.QCheckBox("×  Current")
+        self.reference_checkbox = QtWidgets.QCheckBox("○  Reference")
+        self.predicted_checkbox = QtWidgets.QCheckBox("+  Predicted")
+        self.correction_vectors_checkbox = QtWidgets.QCheckBox("—  Correction vectors")
+        self.residuals_checkbox = QtWidgets.QCheckBox("—  Residuals")
+        self.global_fit_checkbox = QtWidgets.QCheckBox("+  Global fit")
+        self.current_checkbox.setStyleSheet("color: #55aa55;")
+        self.reference_checkbox.setStyleSheet("color: #e06cdb;")
+        self.predicted_checkbox.setStyleSheet("color: #55c7d9;")
+        self.correction_vectors_checkbox.setStyleSheet("color: #ff9966;")
+        self.residuals_checkbox.setStyleSheet("color: #cc6666;")
+        self.global_fit_checkbox.setStyleSheet("color: #aaaaaa;")
+        for checkbox in (
+            self.current_checkbox,self.reference_checkbox,self.predicted_checkbox,
+        ):
+            checkbox.setChecked(True)
+        for checkbox in (
+            self.correction_vectors_checkbox,self.residuals_checkbox,
+            self.global_fit_checkbox,
+        ):
+            checkbox.setChecked(False)
+        self.current_checkbox.setToolTip("Localized positions of the current CGH.")
+        self.reference_checkbox.setToolTip(
+            "Desired detector positions from the selected reference source."
         )
-        legend.setStyleSheet("color: %s;" % _MUTED_COLOR)
-        footer.addWidget(legend)
+        self.predicted_checkbox.setToolTip(
+            "Where Current is predicted to land after the selected correction."
+        )
+        self.correction_vectors_checkbox.setToolTip(
+            "Current → Predicted correction vectors."
+        )
+        self.residuals_checkbox.setToolTip(
+            "Predicted → Reference residual vectors."
+        )
+        self.global_fit_checkbox.setToolTip(
+            "Original global lattice fit retained as a diagnostic overlay."
+        )
+        for checkbox in (
+            self.current_checkbox,self.reference_checkbox,self.predicted_checkbox,
+            self.correction_vectors_checkbox,self.residuals_checkbox,
+            self.global_fit_checkbox,
+        ):
+            checkbox.toggled.connect(self._apply_overlay_visibility)
+            overlay_row.addWidget(checkbox)
+        overlay_row.addStretch(1)
+        layout.addLayout(overlay_row)
+
+        footer = QtWidgets.QHBoxLayout()
+        footer.setContentsMargins(0,0,0,0)
+        footer.setSpacing(8)
+        # Overlay checkboxes above now carry the legend symbols/colors, so the
+        # footer is reserved for quantitative status and view controls.
         footer.addStretch(1)
         self.summary_label = QtWidgets.QLabel("")
         self.summary_label.setStyleSheet("color: %s;" % _MUTED_COLOR)
@@ -647,9 +777,80 @@ class PositionReferenceView(QtWidgets.QWidget):
         layout.addLayout(footer)
         self.clear()
 
+    @staticmethod
+    def _transform_in_shifted_frame(
+        transform: FittedTransform2D,offset_px: np.ndarray,*,to_local: bool,
+    ) -> FittedTransform2D:
+        """Re-express a displacement transform after a detector-origin shift.
+
+        Backend alignment transforms live in full-detector coordinates while the
+        detector workbench displays localization-crop coordinates.  The two
+        frames differ only by ``full = local + offset``.
+        """
+        offset=np.asarray(offset_px,dtype=np.float64).reshape(2)
+        if transform.model==TRANSFORM_POLYNOMIAL:
+            center=np.asarray(transform.normalization_center,dtype=np.float64)
+            center=center-offset if to_local else center+offset
+            return FittedTransform2D(
+                model=transform.model,
+                coefficients=np.asarray(transform.coefficients,dtype=np.float64),
+                normalization_center=center,
+                normalization_scale=np.asarray(
+                    transform.normalization_scale,dtype=np.float64,
+                ),
+                polynomial_degree=transform.polynomial_degree,
+                rms_residual=transform.rms_residual,
+                max_residual=transform.max_residual,
+            )
+
+        matrix=np.asarray(transform.matrix,dtype=np.float64).copy()
+        linear=matrix[:,:2]
+        origin_term=(linear-np.eye(2,dtype=np.float64))@offset
+        matrix[:,2] += origin_term if to_local else -origin_term
+        return FittedTransform2D(
+            model=transform.model,matrix=matrix,
+            rms_residual=transform.rms_residual,
+            max_residual=transform.max_residual,
+        )
+
+    def _transform_to_local_frame(
+        self,transform: FittedTransform2D | None,
+    ) -> FittedTransform2D | None:
+        if transform is None:
+            return None
+        return self._transform_in_shifted_frame(
+            transform,self._crop_offset_px,to_local=True,
+        )
+
+    def _transform_to_backend_frame(
+        self,transform: FittedTransform2D | None,
+    ) -> FittedTransform2D | None:
+        if transform is None:
+            return None
+        return self._transform_in_shifted_frame(
+            transform,self._crop_offset_px,to_local=False,
+        )
+
+    def _same_interactive_transform(
+        self,left: FittedTransform2D | None,right: FittedTransform2D | None,
+    ) -> bool:
+        if left is None or right is None or left.model!=right.model:
+            return False
+        positions=self._global_positions
+        if positions is None:
+            return False
+        try:
+            return bool(np.allclose(
+                left.displacement(positions),right.displacement(positions),
+                rtol=1e-10,atol=1e-8,
+            ))
+        except (TypeError,ValueError):
+            return False
+
     def set_preview(
         self,preview: Mapping[str,Any] | None,*,center_editable: bool=False,
     ) -> None:
+        self._live_preview_timer.stop()
         if not preview:
             self.clear()
             return
@@ -658,40 +859,84 @@ class PositionReferenceView(QtWidgets.QWidget):
         global_positions = np.asarray(
             preview.get("global_positions_px"),dtype=np.float64,
         )
-        reference = np.asarray(
+        predicted = np.asarray(
             preview.get("reference_positions_px"),dtype=np.float64,
+        )
+        reference = np.asarray(
+            preview.get("raw_reference_positions_px",predicted),dtype=np.float64,
         )
         if image.ndim != 2:
             raise ValueError("Position-reference preview image must be two-dimensional")
-        for name,array in (("measured",measured),("global",global_positions),("reference",reference)):
+        for name,array in (
+            ("measured",measured),("global",global_positions),
+            ("predicted",predicted),("reference",reference),
+        ):
             if array.ndim != 2 or array.shape[0] != 2:
                 raise ValueError("%s positions must have shape (2, N)" % name)
-        if measured.shape != reference.shape or global_positions.shape != reference.shape:
+        if (
+            measured.shape != predicted.shape
+            or global_positions.shape != predicted.shape
+            or reference.shape != predicted.shape
+        ):
             raise ValueError("Position-reference preview point arrays must share shape")
 
-        # Reference-parameter edits (editable geometry or saved-reference
-        # selection) should update the overlay in place without
-        # destroying the user's zoom/pan.  Auto-range only when the measured
-        # localization itself is new.
+        measurement_id = preview.get("measurement_id")
+        measurement_changed = bool(
+            measurement_id is not None
+            and measurement_id != self._measurement_id
+        )
         reset_view = (
             self._preview is None
+            or measurement_changed
             or self._measured_positions is None
             or self._measured_positions.shape != measured.shape
             or not np.array_equal(self._measured_positions,measured)
         )
+        reference_changed = (
+            self._raw_reference_positions is None
+            or self._raw_reference_positions.shape != reference.shape
+            or not np.array_equal(self._raw_reference_positions,reference)
+        )
+        current_editor_transform=(
+            self._current_interactive_transform()
+            if self._preview is not None else None
+        )
 
         self._preview = dict(preview)
+        self._measurement_id = measurement_id
+        self._crop_offset_px=np.asarray(
+            preview.get("crop_offset_px",(0.0,0.0)),dtype=np.float64,
+        ).reshape(2)
         self._measured_positions = np.array(measured,copy=True)
-        self._reference_positions = np.array(reference,copy=True)
+        self._global_positions = np.array(global_positions,copy=True)
+        self._reference_positions = np.array(predicted,copy=True)
+        self._raw_reference_positions = np.array(reference,copy=True)
         self._fit_center = np.asarray(preview.get("fit_center_px"),dtype=np.float64).reshape(2)
         self._reference_center = np.asarray(
             preview.get("reference_center_px"),dtype=np.float64,
         ).reshape(2)
 
-        self.image_item.setImage(image,autoLevels=True)
-        self.global_item.setData(x=global_positions[0],y=global_positions[1])
-        self.measured_item.setData(x=measured[0],y=measured[1])
-        self._set_reference_overlay(reference)
+        # A manual-transform commit refreshes the same localization. Avoid
+        # re-uploading/re-autoleveling the detector image and rebuilding static
+        # scatter items in that common release path.
+        if reset_view:
+            self.image_item.setImage(image,autoLevels=True)
+            self.global_item.setData(x=global_positions[0],y=global_positions[1])
+            self.measured_item.setData(x=measured[0],y=measured[1])
+        self._set_reference_overlay(predicted)
+        if reset_view or reference_changed:
+            self.raw_reference_item.setData(x=reference[0],y=reference[1])
+        self._set_residual_overlay(predicted,reference)
+
+        backend_transform=self._preview_transform(preview)
+        incoming_transform=self._transform_to_local_frame(backend_transform)
+        keep_editor=self._same_interactive_transform(
+            current_editor_transform,incoming_transform,
+        )
+        self._fitted_transform=incoming_transform
+        if not keep_editor:
+            self._prepare_interactive_editor()
+
         self._updating_center = True
         try:
             self.center_item.setPos(
@@ -701,66 +946,531 @@ class PositionReferenceView(QtWidgets.QWidget):
             self._updating_center = False
         self.center_item.setVisible(bool(center_editable))
         self.center_item.movable = bool(center_editable)
-        displacement = reference-measured
-        magnitudes = np.linalg.norm(displacement,axis=0)
-        self.summary_label.setText(
-            "%d spots · Δ median %.3g px · max %.3g px" % (
-                reference.shape[1],
-                float(np.median(magnitudes)) if magnitudes.size else 0.0,
-                float(np.max(magnitudes)) if magnitudes.size else 0.0,
-            )
-        )
+        self._update_summary(predicted)
+        self._apply_overlay_visibility()
+        self._refresh_interactive_visibility()
         self.reset_button.setEnabled(True)
         if reset_view:
             self.view_box.autoRange()
+
+    def _preview_transform(self,preview: Mapping[str,Any]) -> FittedTransform2D | None:
+        payload=preview.get("fitted_transform")
+        if payload:
+            try:
+                return FittedTransform2D.from_dict(payload)
+            except (KeyError,TypeError,ValueError):
+                pass
+        affine=preview.get("affine_transform")
+        if affine is None:
+            return None
+        try:
+            return FittedTransform2D(model=TRANSFORM_AFFINE,matrix=affine)
+        except (TypeError,ValueError):
+            return None
+
+    def set_background_image(self,image: Any) -> None:
+        """Replace only the detector image beneath the alignment overlays."""
+        array=np.asarray(image,dtype=np.float64)
+        if array.ndim!=2:
+            raise ValueError("Position-reference background image must be two-dimensional")
+        self.image_item.setImage(array,autoLevels=True)
 
     def set_center_editable(self,enabled: bool) -> None:
         visible = bool(enabled and self._preview is not None)
         self.center_item.setVisible(visible)
         self.center_item.movable = visible
 
+    def set_interactive_editing(self,enabled: bool,model: str | None=None) -> None:
+        self._interactive_editable=bool(enabled)
+        self._interactive_model=None if model is None else str(model)
+        if not self._interactive_editable:
+            self._live_preview_timer.stop()
+        self._refresh_interactive_visibility()
+
     def clear(self) -> None:
+        self._live_preview_timer.stop()
         self._preview = None
+        self._measurement_id = None
         self._reference_positions = None
+        self._display_predicted_positions = None
+        self._raw_reference_positions = None
         self._measured_positions = None
+        self._global_positions = None
         self._fit_center = None
         self._reference_center = None
+        self._crop_offset_px = np.zeros(2,dtype=np.float64)
+        self._fitted_transform = None
         self.image_item.clear()
         self.global_item.setData(x=[],y=[])
         self.measured_item.setData(x=[],y=[])
         self.reference_item.setData(x=[],y=[])
+        self.raw_reference_item.setData(x=[],y=[])
         self.vector_item.setData([],[])
+        self.residual_item.setData([],[])
         self.center_item.setVisible(False)
+        self._hide_matrix_editor()
+        self._clear_polynomial_overlay()
         self.summary_label.setText("Reference preview unavailable")
         self.reset_button.setEnabled(False)
 
-    def _set_reference_overlay(self,reference: np.ndarray) -> None:
+    def _set_reference_overlay(self,predicted: np.ndarray) -> None:
         measured = self._measured_positions
         if measured is None:
             return
-        self.reference_item.setData(x=reference[0],y=reference[1])
-        count = reference.shape[1]
+        predicted=np.asarray(predicted,dtype=np.float64)
+        self._display_predicted_positions=np.array(predicted,copy=True)
+
+        # Hidden overlays should not participate in the live-drag hot path.
+        # _apply_overlay_visibility() repopulates them from the cached latest
+        # positions when the user enables them.
+        if self.predicted_checkbox.isChecked():
+            self.reference_item.setData(x=predicted[0],y=predicted[1])
+        if self.correction_vectors_checkbox.isChecked():
+            count = predicted.shape[1]
+            x = np.empty(2*count,dtype=np.float64)
+            y = np.empty(2*count,dtype=np.float64)
+            x[0::2],x[1::2] = measured[0],predicted[0]
+            y[0::2],y[1::2] = measured[1],predicted[1]
+            self.vector_item.setData(x=x,y=y,connect="pairs")
+
+    def _set_residual_overlay(
+        self,predicted: np.ndarray,reference: np.ndarray,
+    ) -> None:
+        if not self.residuals_checkbox.isChecked():
+            return
+        count = predicted.shape[1]
         x = np.empty(2*count,dtype=np.float64)
         y = np.empty(2*count,dtype=np.float64)
-        x[0::2],x[1::2] = measured[0],reference[0]
-        y[0::2],y[1::2] = measured[1],reference[1]
-        self.vector_item.setData(x=x,y=y,connect="pairs")
+        x[0::2],x[1::2] = predicted[0],reference[0]
+        y[0::2],y[1::2] = predicted[1],reference[1]
+        self.residual_item.setData(x=x,y=y,connect="pairs")
+
+    def _update_summary(self,predicted: np.ndarray) -> None:
+        measured=self._measured_positions
+        reference=self._raw_reference_positions
+        if measured is None or reference is None:
+            return
+        displacement=np.linalg.norm(predicted-measured,axis=0)
+        displacement_median=(
+            float(np.median(displacement)) if displacement.size else 0.0
+        )
+        reference_metadata=(
+            dict(self._preview.get("reference") or {})
+            if isinstance(self._preview,Mapping) else {}
+        )
+        if str(reference_metadata.get("mode") or "")=="current":
+            displacement_rms=(
+                float(np.sqrt(np.mean(displacement*displacement)))
+                if displacement.size else 0.0
+            )
+            self.summary_label.setText(
+                "%d spots · displacement median %.3g px · displacement RMS %.3g px"
+                % (predicted.shape[1],displacement_median,displacement_rms)
+            )
+            return
+
+        residual=np.linalg.norm(reference-predicted,axis=0)
+        residual_rms=(
+            float(np.sqrt(np.mean(residual*residual))) if residual.size else 0.0
+        )
+        self.summary_label.setText(
+            "%d spots · correction median %.3g px · residual RMS %.3g px" % (
+                predicted.shape[1],displacement_median,residual_rms,
+            )
+        )
+
+    def _apply_overlay_visibility(self,*_args: Any) -> None:
+        self.measured_item.setVisible(self.current_checkbox.isChecked())
+        self.raw_reference_item.setVisible(self.reference_checkbox.isChecked())
+        self.reference_item.setVisible(self.predicted_checkbox.isChecked())
+        self.vector_item.setVisible(self.correction_vectors_checkbox.isChecked())
+        self.residual_item.setVisible(self.residuals_checkbox.isChecked())
+        self.global_item.setVisible(self.global_fit_checkbox.isChecked())
+
+        predicted=self._display_predicted_positions
+        if predicted is not None:
+            if (
+                self.predicted_checkbox.isChecked()
+                or self.correction_vectors_checkbox.isChecked()
+            ):
+                self._set_reference_overlay(predicted)
+            reference=self._raw_reference_positions
+            if reference is not None and self.residuals_checkbox.isChecked():
+                self._set_residual_overlay(predicted,reference)
+
+    def _prepare_interactive_editor(self) -> None:
+        transform=self._fitted_transform
+        global_positions=self._global_positions
+        if transform is None or global_positions is None:
+            self._hide_matrix_editor()
+            self._clear_polynomial_overlay()
+            return
+        if transform.model in {
+            TRANSFORM_TRANSLATION,TRANSFORM_RIGID,TRANSFORM_AFFINE,
+        }:
+            self._clear_polynomial_overlay()
+            self._set_matrix_transform(global_positions,transform)
+        elif transform.model==TRANSFORM_POLYNOMIAL:
+            self._hide_matrix_editor()
+            self._set_polynomial_transform(global_positions,transform)
+        else:
+            self._hide_matrix_editor()
+            self._clear_polynomial_overlay()
+
+    def _refresh_interactive_visibility(self) -> None:
+        transform=self._fitted_transform
+        model=None if transform is None else transform.model
+        requested=self._interactive_model or model
+        matrix_visible=bool(
+            self._interactive_editable and self._preview is not None
+            and model in {TRANSFORM_TRANSLATION,TRANSFORM_RIGID,TRANSFORM_AFFINE}
+            and requested==model
+        )
+        self.matrix_frame_item.setVisible(matrix_visible)
+        self.matrix_origin_item.setVisible(matrix_visible)
+        self.matrix_origin_item.movable=matrix_visible
+        rigid_or_affine=bool(
+            matrix_visible and model in {TRANSFORM_RIGID,TRANSFORM_AFFINE}
+        )
+        self.matrix_x_item.setVisible(rigid_or_affine)
+        self.matrix_x_item.movable=rigid_or_affine
+        affine_only=bool(matrix_visible and model==TRANSFORM_AFFINE)
+        self.matrix_y_item.setVisible(affine_only)
+        self.matrix_y_item.movable=affine_only
+        polynomial_visible=bool(
+            self._interactive_editable and self._preview is not None
+            and model==TRANSFORM_POLYNOMIAL and requested==TRANSFORM_POLYNOMIAL
+        )
+        self.polynomial_mesh_item.setVisible(polynomial_visible)
+        for item in self._polynomial_handles:
+            item.setVisible(polynomial_visible)
+            item.movable=polynomial_visible
+
+    @staticmethod
+    def _target_position(item: pg.TargetItem) -> np.ndarray:
+        pos=item.pos()
+        return np.asarray([float(pos.x()),float(pos.y())],dtype=np.float64)
+
+    def _set_matrix_transform(
+        self,global_positions: np.ndarray,transform: FittedTransform2D,
+    ) -> None:
+        points=np.asarray(global_positions,dtype=np.float64)
+        if points.shape[0]!=2 or transform.model not in {
+            TRANSFORM_TRANSLATION,TRANSFORM_RIGID,TRANSFORM_AFFINE,
+        }:
+            self._hide_matrix_editor()
+            return
+        xmin,xmax=np.min(points[0]),np.max(points[0])
+        ymin,ymax=np.min(points[1]),np.max(points[1])
+        if abs(float(xmax-xmin))<1e-9 or abs(float(ymax-ymin))<1e-9:
+            self._hide_matrix_editor()
+            return
+        center=np.asarray([(xmin+xmax)/2.0,(ymin+ymax)/2.0])
+        source_anchors=np.column_stack([
+            center,
+            [xmax,center[1]],
+            [center[0],ymax],
+        ]).astype(np.float64)
+        source_corners=np.asarray([
+            [xmin,xmax,xmax,xmin],
+            [ymin,ymin,ymax,ymax],
+        ],dtype=np.float64)
+        target_anchors=transform.apply(source_anchors)
+        self._matrix_source_anchors=source_anchors
+        self._matrix_source_corners=source_corners
+        self._matrix_editor_updating=True
+        try:
+            self.matrix_origin_item.setPos(*target_anchors[:,0])
+            self.matrix_x_item.setPos(*target_anchors[:,1])
+            self.matrix_y_item.setPos(*target_anchors[:,2])
+            self._matrix_last_origin=np.array(target_anchors[:,0],copy=True)
+        finally:
+            self._matrix_editor_updating=False
+        self._update_matrix_frame()
+
+    def _hide_matrix_editor(self) -> None:
+        self._matrix_source_anchors=None
+        self._matrix_source_corners=None
+        self._matrix_last_origin=None
+        self.matrix_frame_item.setData([],[])
+        for item in (
+            self.matrix_frame_item,self.matrix_origin_item,self.matrix_x_item,
+            self.matrix_y_item,
+        ):
+            item.setVisible(False)
+
+    def _current_matrix_transform(self) -> FittedTransform2D | None:
+        """Return the transform represented by the shared matrix-editor cage.
+
+        Translation, rigid and affine editing use the same handles with
+        model-specific constraints.
+        """
+        source=self._matrix_source_anchors
+        if source is None:
+            return None
+        model=(
+            self._interactive_model
+            or (None if self._fitted_transform is None else self._fitted_transform.model)
+        )
+        origin=self._target_position(self.matrix_origin_item)
+        try:
+            if model==TRANSFORM_TRANSLATION:
+                shift=origin-source[:,0]
+                matrix=np.column_stack([np.eye(2,dtype=np.float64),shift])
+                return FittedTransform2D(model=model,matrix=matrix)
+
+            if model==TRANSFORM_RIGID:
+                source_vector=source[:,1]-source[:,0]
+                target_vector=self._target_position(self.matrix_x_item)-origin
+                source_norm=float(np.linalg.norm(source_vector))
+                target_norm=float(np.linalg.norm(target_vector))
+                if source_norm<1e-12 or target_norm<1e-12:
+                    return None
+                source_angle=float(np.arctan2(source_vector[1],source_vector[0]))
+                target_angle=float(np.arctan2(target_vector[1],target_vector[0]))
+                angle=target_angle-source_angle
+                c,s=np.cos(angle),np.sin(angle)
+                rotation=np.asarray([[c,-s],[s,c]],dtype=np.float64)
+                translation=origin-rotation@source[:,0]
+                matrix=np.column_stack([rotation,translation])
+                return FittedTransform2D(model=model,matrix=matrix)
+
+            if model!=TRANSFORM_AFFINE:
+                return None
+            target=np.column_stack([
+                origin,
+                self._target_position(self.matrix_x_item),
+                self._target_position(self.matrix_y_item),
+            ])
+            design=np.column_stack([source.T,np.ones(3,dtype=np.float64)])
+            coefficients=np.linalg.solve(design,target.T)
+            return FittedTransform2D(
+                model=TRANSFORM_AFFINE,matrix=coefficients.T,
+            )
+        except (np.linalg.LinAlgError,ValueError):
+            return None
+
+    def _update_matrix_frame(self) -> None:
+        transform=self._current_matrix_transform()
+        corners=self._matrix_source_corners
+        if transform is None or corners is None:
+            self.matrix_frame_item.setData([],[])
+            return
+        mapped=transform.apply(corners)
+        closed=np.column_stack([mapped,mapped[:,0]])
+        self.matrix_frame_item.setData(x=closed[0],y=closed[1])
+
+    def _on_matrix_origin_changed(self,*_args: Any) -> None:
+        if self._matrix_editor_updating:
+            return
+        origin=self._target_position(self.matrix_origin_item)
+        previous=self._matrix_last_origin
+        self._matrix_last_origin=np.array(origin,copy=True)
+        if previous is not None:
+            delta=origin-previous
+            self._matrix_editor_updating=True
+            try:
+                for item in (self.matrix_x_item,self.matrix_y_item):
+                    current=self._target_position(item)+delta
+                    item.setPos(float(current[0]),float(current[1]))
+            finally:
+                self._matrix_editor_updating=False
+        self._update_matrix_live_preview()
+
+    def _on_matrix_axis_changed(self,*_args: Any) -> None:
+        if self._matrix_editor_updating:
+            return
+        if self._interactive_model==TRANSFORM_RIGID:
+            source=self._matrix_source_anchors
+            if source is not None:
+                origin=self._target_position(self.matrix_origin_item)
+                vector=self._target_position(self.matrix_x_item)-origin
+                norm=float(np.linalg.norm(vector))
+                radius=float(np.linalg.norm(source[:,1]-source[:,0]))
+                if norm>1e-12 and radius>1e-12:
+                    snapped=origin+(radius/norm)*vector
+                    self._matrix_editor_updating=True
+                    try:
+                        self.matrix_x_item.setPos(float(snapped[0]),float(snapped[1]))
+                    finally:
+                        self._matrix_editor_updating=False
+        self._update_matrix_live_preview()
+
+    def _update_matrix_live_preview(self) -> None:
+        self._update_matrix_frame()
+        self._schedule_interactive_live_preview()
+
+    def _on_matrix_edit_finished(self,*_args: Any) -> None:
+        if self._matrix_editor_updating or not self._interactive_editable:
+            return
+        transform=self._flush_interactive_live_preview()
+        backend_transform=self._transform_to_backend_frame(transform)
+        if backend_transform is None:
+            return
+        self.sigManualTransformRequested.emit(backend_transform.to_dict())
+
+    def _set_polynomial_transform(
+        self,global_positions: np.ndarray,transform: FittedTransform2D,
+    ) -> None:
+        points=np.asarray(global_positions,dtype=np.float64)
+        if points.shape[0]!=2 or transform.model!=TRANSFORM_POLYNOMIAL:
+            self._clear_polynomial_overlay()
+            return
+        xmin,xmax=np.min(points[0]),np.max(points[0])
+        ymin,ymax=np.min(points[1]),np.max(points[1])
+        if abs(float(xmax-xmin))<1e-9 or abs(float(ymax-ymin))<1e-9:
+            self._clear_polynomial_overlay()
+            return
+        degree=int(transform.polynomial_degree or 2)
+        grid_size=max(3,degree+1)
+        xs=np.linspace(xmin,xmax,grid_size)
+        ys=np.linspace(ymin,ymax,grid_size)
+        xx,yy=np.meshgrid(xs,ys,indexing="xy")
+        source=np.vstack([xx.ravel(),yy.ravel()])
+        target=transform.apply(source)
+        self._clear_polynomial_handles()
+        self._polynomial_source_handles=source
+        self._polynomial_grid_shape=(grid_size,grid_size)
+        self._polynomial_degree=degree
+        self._polynomial_updating=True
+        try:
+            for index in range(source.shape[1]):
+                item=pg.TargetItem(
+                    movable=True,size=9,pen=pg.mkPen("#ffcc66",width=1.2),
+                )
+                self.view_box.addItem(item)
+                item.setPos(float(target[0,index]),float(target[1,index]))
+                item.sigPositionChanged.connect(self._on_polynomial_handle_changed)
+                item.sigPositionChangeFinished.connect(
+                    self._on_polynomial_edit_finished
+                )
+                self._polynomial_handles.append(item)
+        finally:
+            self._polynomial_updating=False
+        self._update_polynomial_mesh()
+
+    def _clear_polynomial_handles(self) -> None:
+        for item in self._polynomial_handles:
+            self.view_box.removeItem(item)
+        self._polynomial_handles=[]
+
+    def _clear_polynomial_overlay(self) -> None:
+        self._clear_polynomial_handles()
+        self._polynomial_source_handles=None
+        self._polynomial_grid_shape=None
+        self.polynomial_mesh_item.setData([],[])
+        self.polynomial_mesh_item.setVisible(False)
+
+    def _polynomial_target_handles(self) -> np.ndarray | None:
+        if not self._polynomial_handles:
+            return None
+        return np.column_stack([
+            self._target_position(item) for item in self._polynomial_handles
+        ])
+
+    def _current_polynomial_transform(self) -> FittedTransform2D | None:
+        source=self._polynomial_source_handles
+        target=self._polynomial_target_handles()
+        if source is None or target is None:
+            return None
+        try:
+            return fit_transform2d(
+                source,target-source,model=TRANSFORM_POLYNOMIAL,
+                polynomial_degree=self._polynomial_degree,
+            )
+        except (TypeError,ValueError,np.linalg.LinAlgError):
+            return None
+
+    def _update_polynomial_mesh(self) -> None:
+        target=self._polynomial_target_handles()
+        shape=self._polynomial_grid_shape
+        if target is None or shape is None:
+            self.polynomial_mesh_item.setData([],[])
+            return
+        rows,cols=shape
+        grid=target.reshape(2,rows,cols)
+        segments=[]
+        for row in range(rows):
+            segments.append(grid[:,row,:])
+        for col in range(cols):
+            segments.append(grid[:,:,col])
+        x=[]; y=[]
+        for segment in segments:
+            x.extend(segment[0].tolist()); x.append(np.nan)
+            y.extend(segment[1].tolist()); y.append(np.nan)
+        self.polynomial_mesh_item.setData(x=np.asarray(x),y=np.asarray(y))
+
+    def _on_polynomial_handle_changed(self,*_args: Any) -> None:
+        if self._polynomial_updating:
+            return
+        self._update_polynomial_mesh()
+        self._schedule_interactive_live_preview()
+
+    def _on_polynomial_edit_finished(self,*_args: Any) -> None:
+        if self._polynomial_updating or not self._interactive_editable:
+            return
+        transform=self._flush_interactive_live_preview()
+        backend_transform=self._transform_to_backend_frame(transform)
+        if backend_transform is not None:
+            self.sigManualTransformRequested.emit(backend_transform.to_dict())
+
+    def _schedule_interactive_live_preview(self) -> None:
+        """Coalesce drag-driven redraw work to at most 10 Hz."""
+        if not self._interactive_editable or self._preview is None:
+            return
+        if not self._live_preview_timer.isActive():
+            self._live_preview_timer.start()
+
+    def _current_interactive_transform(self) -> FittedTransform2D | None:
+        model=(
+            self._interactive_model
+            or (None if self._fitted_transform is None else self._fitted_transform.model)
+        )
+        if model==TRANSFORM_POLYNOMIAL:
+            return self._current_polynomial_transform()
+        if model in {TRANSFORM_TRANSLATION,TRANSFORM_RIGID,TRANSFORM_AFFINE}:
+            return self._current_matrix_transform()
+        return None
+
+    def _flush_interactive_live_preview(self) -> FittedTransform2D | None:
+        """Render the latest drag state and return its transform.
+
+        Drag-finished handlers call this directly so the final visual state is
+        always rendered even if the 100 ms timer has not fired yet.
+        """
+        self._live_preview_timer.stop()
+        transform=self._current_interactive_transform()
+        if transform is not None:
+            self._update_transform_live_preview(transform)
+        return transform
+
+    def _update_transform_live_preview(self,transform: FittedTransform2D) -> None:
+        global_positions=self._global_positions
+        measured=self._measured_positions
+        if global_positions is None or measured is None:
+            return
+        predicted=measured+transform.displacement(global_positions)
+        self._set_reference_overlay(predicted)
+        reference=self._raw_reference_positions
+        if reference is not None:
+            self._set_residual_overlay(predicted,reference)
+        self._update_summary(predicted)
 
     def _on_center_position_changed(self,*_args: Any) -> None:
         if self._updating_center or self._reference_positions is None:
             return
-        pos = self.center_item.pos()
-        center = np.asarray([float(pos.x()),float(pos.y())],dtype=np.float64)
-        base_center = self._reference_center
+        pos=self.center_item.pos()
+        center=np.asarray([float(pos.x()),float(pos.y())],dtype=np.float64)
+        base_center=self._reference_center
         if base_center is None:
             return
-        shifted = self._reference_positions + (center-base_center)[:,None]
+        shifted=self._reference_positions+(center-base_center)[:,None]
         self._set_reference_overlay(shifted)
 
     def _on_center_position_finished(self,*_args: Any) -> None:
         if self._updating_center or self._fit_center is None:
             return
-        pos = self.center_item.pos()
+        pos=self.center_item.pos()
         self.sigCenterOffsetRequested.emit(
             float(pos.x())-float(self._fit_center[0]),
             float(pos.y())-float(self._fit_center[1]),
@@ -775,7 +1485,7 @@ class PositionCorrectionView(QtWidgets.QWidget):
     is presentation-only and never changes the represented correction values.
     """
 
-    DEFAULT_VECTOR_SCALE = 10.0
+    DEFAULT_VECTOR_SCALE = 2.0
 
     def __init__(self,parent: QtWidgets.QWidget | None=None) -> None:
         super().__init__(parent)

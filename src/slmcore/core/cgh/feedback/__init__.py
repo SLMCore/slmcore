@@ -13,10 +13,16 @@ from .model import (
     RoundEvaluation,
 )
 from ..measurement_metrics import IntensityAnalysis
+from .correspondence import (
+    ReferenceCorrespondence,ReferenceCorrespondenceResolution,
+    reference_correspondence_options,resolve_reference_correspondence,
+)
 from .orientation import (
     FeedbackOrientation,
+    orient_lattice_representation,
     orient_localization,
     orientation_permutation,
+    orientation_reindex_permutation,
 )
 from .reference import (
     EditablePositionReferenceGeometry,
@@ -29,7 +35,6 @@ from .reference import (
     localization_positions_full_px,
     reference_positions_for_localization,
 )
-from .fov_calibration import FOVPositionCalibration
 from .geometry_calibration import (
     GEOMETRY_ORIENTATION_PROTOCOL,
     GeometryOrientationAnalysis,
@@ -50,7 +55,8 @@ __all__ = [
     "FeedbackMeasurement",
     "FeedbackStatus",
     "FeedbackOrientation",
-    "FOVPositionCalibration",
+    "ReferenceCorrespondence",
+    "ReferenceCorrespondenceResolution",
     "GEOMETRY_ORIENTATION_PROTOCOL",
     "GeometryOrientationAnalysis",
     "GeometryOrientationCalibration",
@@ -73,7 +79,11 @@ __all__ = [
     "editable_reference_center_px",
     "editable_reference_positions",
     "localization_positions_full_px",
+    "orient_lattice_representation",
     "orient_localization",
     "orientation_permutation",
+    "orientation_reindex_permutation",
+    "reference_correspondence_options",
     "reference_positions_for_localization",
+    "resolve_reference_correspondence",
 ]

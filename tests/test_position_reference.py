@@ -169,7 +169,7 @@ def test_saved_reference_uses_full_detector_coordinates_and_resolves_new_crop():
 
     reference = PositionReference(
         name="alignment",
-        plane_name="sample",
+        observation_plane_name="sample",
         lattice_indices=localization.lattice_indices,
         positions_px=full,
         image_shape=(120,140),
@@ -219,6 +219,27 @@ def test_analyze_position_without_reference_keeps_legacy_result_exactly():
     np.testing.assert_array_equal(legacy.correction_kxy,explicit.correction_kxy)
     np.testing.assert_array_equal(
         legacy.corrected_positions_kxy,explicit.corrected_positions_kxy,
+    )
+
+
+
+
+def test_position_analysis_physical_errors_use_measurement_pixel_size():
+    localization = _localization(crop=(0,80,0,80))
+    acquisition = ImageMeasurement(
+        image=np.zeros((80,80),dtype=np.float64),source="test",pixel_size_um=0.25,
+    )
+    measurement = FeedbackMeasurement(
+        acquisition=acquisition,localization=localization,
+    )
+    ideal = np.asarray(localization.lattice_indices,dtype=np.float64)*0.05
+
+    analysis = analyze_position(
+        measurement,ideal_positions_kxy=ideal,parameters={},
+    )
+
+    np.testing.assert_allclose(
+        analysis.position_errors_um,analysis.position_errors_px*0.25,
     )
 
 

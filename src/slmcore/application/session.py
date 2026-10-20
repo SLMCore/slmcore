@@ -2,11 +2,13 @@ from __future__ import annotations
 import numpy as np
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any,Callable,Mapping
+from typing import Any,Callable,Mapping,TYPE_CHECKING
 
 from ..core.cgh.execution.executor import CGHExecutionHandle,CGHExecutor
 from ..core.cgh.execution.result import CGHResult
 from ..core.engine.runtime import SLMRuntime
+from ..core.engine.state import ConfigWarning
+from ..core.config import FOVCorrectionConfigState,SLMConfig
 from ..core.engine.section import SectionPresentation
 from ..core.engine.state import GroupTopology
 from ..core.engine.transition import SectionStateTransition
@@ -18,12 +20,30 @@ from .configuration import (
 )
 from .control_mode import SLMControlMode
 from .runtime_factory import SLMRuntimeFactory
+from ..workspace.position_reference_store import PositionReferenceStore
+from .observation import ObservationPlaneService
+from .observation_geometry import ObservationGeometryService
+from .observation_registration import ObservationRegistrationService
+from .observation_registration_calibration import ObservationRegistrationCalibrationService
+from .mapping import MappingService
 from .feedback import (
     AutomaticFeedbackState,MeasurementDispatcher,SLMFeedbackCallbacks,
     SLMFeedbackService,
 )
 from .calibration import SLMCalibrationCallbacks,SLMCalibrationService
+from .fov_calibration import FOVCalibrationService
+from .fov_mapping_runtime import FOVMappingRuntimeService
+from .geometry_calibration import GeometryCalibrationPayload,GeometryCalibrationService
 from .section_layout import PreparedSectionLayoutChange,SLMSectionLayoutService
+
+if TYPE_CHECKING:
+    from ..workspace.calibration_store import SLMCalibrationStore
+    from ..workspace.fov_mapping_correction_store import FOVMappingCorrectionStore
+    from ..workspace.geometry_orientation_calibration_store import SLMGeometryOrientationCalibrationStore
+    from ..workspace.observation_plane_store import ObservationPlaneStore
+    from ..workspace.observation_registration_store import ObservationRegistrationStore
+    from ..workspace.mapping_store import MappingStore
+    from .startup_preferences import StartupPreferencesState
 
 
 def _noop(*_args,**_kwargs) -> None:
@@ -42,17 +62,18 @@ class SLMSessionCallbacks:
     on_frame_changed: Callable[[Any],None] = _noop
     on_transition_committed: Callable[[str,SectionStateTransition],None] = _noop
     on_section_refresh_requested: Callable[[str],None] = _noop
+    on_feedback_state_changed: Callable[[str],None] = _noop
+    on_position_reference_changed: Callable[[str],None] = _noop
     on_cgh_computing_changed: Callable[[str,bool],None] = _noop
     on_warning: Callable[[str,Any],None] = _noop
     on_error: Callable[[str,Exception],None] = _noop
     on_upload_failed: Callable[[Exception],None] = _noop
     on_upload_state_changed: Callable[[bool,Exception | None],None] = _noop
-    on_device_connection_changed: Callable[[DeviceConnectionResult],None] = _noop
     on_runtime_replaced: Callable[[SLMRuntime],None] = _noop
     on_config_committed: Callable[[ConfigLoadOutcome],None] = _noop
     on_control_mode_changed: Callable[[SLMControlMode,str | None],None] = _noop
     on_fast_config_changed: Callable[[str | None],None] = _noop
-    on_calibration_planes_changed: Callable[[],None] = _noop
+    on_calibration_mappings_changed: Callable[[],None] = _noop
     on_calibration_state_changed: Callable[[str],None] = _noop
     on_calibration_measurement_busy_changed: Callable[[str,bool,str],None] = _noop
     on_calibration_measurement_error: Callable[[str,Exception],None] = _noop
@@ -93,11 +114,14 @@ class SLMSession:
         configuration_service: SLMConfigurationService | None=None,
         current_config_path: str | None=None,
         measurement_dispatcher: MeasurementDispatcher | None=None,
-        calibration_store=None,
-        position_reference_store=None,
-        fov_position_calibration_store=None,
-        geometry_orientation_calibration_store=None,
-        startup_preferences=None,
+        calibration_store: SLMCalibrationStore | None=None,
+        mapping_store: MappingStore | None=None,
+        position_reference_store: PositionReferenceStore | None=None,
+        fov_mapping_correction_store: FOVMappingCorrectionStore | None=None,
+        geometry_orientation_calibration_store: SLMGeometryOrientationCalibrationStore | None=None,
+        observation_registration_store: ObservationRegistrationStore | None=None,
+        observation_plane_store: ObservationPlaneStore | None=None,
+        startup_preferences: StartupPreferencesState | None=None,
         display_name: str="",
         apply_startup_calibration_defaults: bool=False,
     ) -> None:
@@ -129,21 +153,72 @@ class SLMSession:
         self._upload_defer_depth = 0
         self._upload_pending = False
         self._last_upload_error: Exception | None = None
-        self.feedback = SLMFeedbackService(
+        self._config_fov_restore_active = False
+
+        self.observation_planes = ObservationPlaneService(observation_plane_store)
+        self.mappings = MappingService(
+            mapping_store,fov_mapping_correction_store,lambda:self.runtime.identity,
+        )
+        self.observation_geometry = ObservationGeometryService(
+            lambda: self.runtime.identity, geometry_orientation_calibration_store,
+        )
+        self.observation_registration = ObservationRegistrationService(
+            lambda: self.runtime.identity, observation_registration_store,
+        )
+        self.observation_registration_calibration = ObservationRegistrationCalibrationService(
             self,
+            observation_planes=self.observation_planes,
+            observation_registration=self.observation_registration,
+        )
+        self.geometry_calibration = GeometryCalibrationService(
+            self,
+            observation_planes=self.observation_planes,
+            observation_geometry=self.observation_geometry,
+            measurements=measurement_dispatcher,
+        )
+
+        # Application services are owned by this session. They may coordinate
+        # runtime operations, but presentation adapters remain outside this layer.
+        self.feedback = SLMFeedbackService(
+            application_session=self,
             measurements=measurement_dispatcher,
             callbacks=self._feedback_callbacks(),
             position_reference_store=position_reference_store,
-            fov_position_calibration_store=fov_position_calibration_store,
-            geometry_orientation_calibration_store=geometry_orientation_calibration_store,
+            observation_geometry=self.observation_geometry,
+            observation_registration=self.observation_registration,
         )
         self.calibration = SLMCalibrationService(
             self,
             store=calibration_store,
+            mappings=self.mappings,
+            observation_planes=self.observation_planes,
+            observation_geometry=self.observation_geometry,
             preferences=startup_preferences,
             display_name=self.display_name,
             measurements=measurement_dispatcher,
             callbacks=self._calibration_callbacks(),
+        )
+        self.fov_mapping_runtime = FOVMappingRuntimeService(
+            runtime_provider=lambda:self.runtime,
+            editor_writes_allowed=lambda:bool(self.editor_writes_allowed),
+            active_mapping=lambda key:self.calibration.active_mapping(key),
+            startup_preferences=lambda:self.startup_preferences,
+            cancel_cgh=lambda key:self.cancel_cgh(key),
+            section_changed=lambda key:self._notify(
+                "on_section_refresh_requested",key,
+            ),
+            transition_committed=lambda key,transition:
+                self._handle_committed_transition(key,transition),
+            mappings=self.mappings,
+        )
+        self.fov_calibration = FOVCalibrationService(
+            self,
+            mappings=self.mappings,
+            observation_planes=self.observation_planes,
+            observation_geometry=self.observation_geometry,
+            calibration_service=self.calibration,
+            startup_preferences=startup_preferences,
+            measurements=measurement_dispatcher,
         )
         if apply_startup_calibration_defaults:
             self.calibration.apply_startup_defaults()
@@ -206,6 +281,8 @@ class SLMSession:
             raise RuntimeError("Cannot replace runtime while CGH computation is active")
         self.feedback.prepare_runtime_change()
         self.calibration.prepare_runtime_change()
+        self.geometry_calibration.prepare_runtime_change()
+        self.observation_registration_calibration.prepare_runtime_change()
         self.runtime = runtime
         self._upload_pending = False
         self._last_upload_error = None
@@ -239,16 +316,32 @@ class SLMSession:
         service = self._require_configuration()
         self.feedback.prepare_runtime_change()
         self.calibration.prepare_runtime_change()
+        self.geometry_calibration.prepare_runtime_change()
+        self.observation_registration_calibration.prepare_runtime_change()
         self.cancel_all_cgh()
-        commit = service.commit_load(
-            self.runtime,
-            prepared,
-            calibration_mismatch_policy=calibration_mismatch_policy,
-            correction_mismatch_policy=correction_mismatch_policy,
-            require_complete=bool(require_complete),
-        )
-        if commit.runtime_replaced:
-            self.replace_runtime(commit.runtime)
+        self._config_fov_restore_active = True
+        try:
+            commit = service.commit_load(
+                self.runtime,
+                prepared,
+                calibration_mismatch_policy=calibration_mismatch_policy,
+                correction_mismatch_policy=correction_mismatch_policy,
+                require_complete=bool(require_complete),
+            )
+            if commit.runtime_replaced:
+                self.replace_runtime(commit.runtime)
+            else:
+                # Mapping selection is application-owned.  Reconcile it from
+                # the newly committed runtime calibration before resolving the
+                # saved mapping-scoped FOV reference.
+                self.calibration.runtime_replaced()
+
+            fov_warnings = self._restore_config_fov_states(
+                prepared.config,
+                skip_sections=commit.failed_section_snapshots,
+            )
+        finally:
+            self._config_fov_restore_active = False
 
         self._current_config_metadata = prepared.metadata
         outcome = ConfigLoadOutcome(
@@ -257,7 +350,7 @@ class SLMSession:
             report=commit.report,
             runtime_replaced=commit.runtime_replaced,
             failed_section_snapshots=commit.failed_section_snapshots,
-            warnings=prepared.warnings,
+            warnings=tuple(prepared.warnings) + tuple(fov_warnings),
         )
         self._notify(
             "on_config_committed",outcome,
@@ -266,6 +359,63 @@ class SLMSession:
         if outcome.frame_changed and self.editor_writes_allowed:
             self.publish_current_frame()
         return outcome
+
+    def _create_application_config(self) -> SLMConfig:
+        """Capture runtime state plus application-owned FOV selection intent."""
+        config = self.runtime.create_config()
+        for section_key,section in config.sections.items():
+            runtime_fov = self.runtime.get_section_fov_mapping_context(
+                section_key
+            ).get("correction")
+            if runtime_fov is not None:
+                name = str(runtime_fov.name)
+                applied = True
+            else:
+                context = self.fov_mapping_runtime.fov_mapping_context(
+                    section_key
+                )
+                name = str(context.get("selected_name") or "").strip() or None
+                applied = False
+            section.fov_correction = FOVCorrectionConfigState(
+                name=name,applied=applied,
+            )
+        return config
+
+    def _restore_config_fov_states(
+        self,config: SLMConfig,*,skip_sections=(),
+    ) -> tuple[ConfigWarning,...]:
+        """Rebind config FOV references without substituting another default."""
+        skipped = {str(key) for key in skip_sections}
+        warnings = []
+        for section_key in self.runtime.section_keys:
+            if section_key in skipped or section_key not in config.sections:
+                continue
+            saved = config.sections[section_key].fov_correction
+            if saved is None:
+                # Schema-1/2 configs did not record FOV intent.  Preserve the
+                # historical per-session/default choice, but rebind it through
+                # the non-destructive config restoration path so a saved CGH
+                # can become synced when the same FOV is still in use.
+                context = self.fov_mapping_runtime.fov_mapping_context(
+                    section_key
+                )
+                applied = bool(context.get("applied",False))
+                name = (
+                    context.get("applied_name")
+                    if applied else context.get("selected_name")
+                )
+                warning = self.fov_mapping_runtime.restore_config_fov_mapping_correction(
+                    section_key,name,applied,
+                )
+            else:
+                warning = self.fov_mapping_runtime.restore_config_fov_mapping_correction(
+                    section_key,saved.name,saved.applied,
+                )
+            if warning:
+                warnings.append(ConfigWarning(
+                    ("sections",section_key,"fov_correction"),str(warning),
+                ))
+        return tuple(warnings)
 
     def load_config(
         self,
@@ -295,8 +445,8 @@ class SLMSession:
     ):
         self._require_active()
         self._require_editor_mode()
-        metadata = self._require_configuration().save_runtime(
-            self.runtime,name,info,overwrite=overwrite,
+        metadata = self._require_configuration().save_config(
+            self._create_application_config(),name,info,overwrite=overwrite,
         )
         self._current_config_metadata = metadata
         return metadata
@@ -304,7 +454,9 @@ class SLMSession:
     def compare_config(self,path: str):
         self._require_active()
         self._require_editor_mode()
-        return self._require_configuration().compare_runtime(self.runtime,path)
+        return self._require_configuration().compare_config(
+            self._create_application_config(),path,
+        )
 
     def read_config_metadata(self,path: str):
         return self._require_configuration().read_metadata(path)
@@ -481,7 +633,6 @@ class SLMSession:
         if device is None:
             raise RuntimeError("No SLM device provider is configured")
         result = device.connect()
-        self._notify("on_device_connection_changed",result)
         if result.connected and upload_current_frame:
             self.upload_current_frame()
         return result
@@ -491,45 +642,7 @@ class SLMSession:
         device = self.host_services.device
         if device is None:
             raise RuntimeError("No SLM device provider is configured")
-        result = device.disconnect()
-        self._notify("on_device_connection_changed",result)
-        return result
-
-    def reconnect_device(self) -> DeviceConnectionResult:
-        """Reconnect the configured device and restore the active frame.
-
-        The operation is owned by the toolkit-independent application session
-        so hosts can request reconnect without bypassing session state. For
-        explicit devices, an existing connection is disconnected first. A
-        successful reconnect always uploads the frame that is authoritative for
-        the current control mode (the active compiled frame in Fast Config mode,
-        otherwise the current runtime frame).
-        """
-        self._require_active()
-        device = self.host_services.device
-        if device is None:
-            raise RuntimeError("No SLM device provider is configured")
-
-        if device.requires_explicit_connection:
-            disconnected = self.disconnect_device()
-            if disconnected.connected:
-                return disconnected
-            connected = self.connect_device(upload_current_frame=False)
-        else:
-            connected = DeviceConnectionResult(connected=True)
-            self._notify("on_device_connection_changed",connected)
-
-        if connected.connected:
-            self._upload_active_device_frame()
-        return connected
-
-    def _upload_active_device_frame(self) -> bool:
-        if self.control_mode is SLMControlMode.FAST_CONFIG and self.fast_config_path:
-            _resolved,frame = self._read_validated_compiled_frame(
-                self.fast_config_path
-            )
-            return self.upload_frame(frame)
-        return self.upload_current_frame()
+        return device.disconnect()
 
     def set_measurement_dispatcher(
         self,measurements: MeasurementDispatcher | None,
@@ -537,6 +650,8 @@ class SLMSession:
         self._require_active()
         self.feedback.set_measurement_dispatcher(measurements)
         self.calibration.set_measurement_dispatcher(measurements)
+        self.fov_calibration.set_measurement_dispatcher(measurements)
+        self.geometry_calibration.set_measurement_dispatcher(measurements)
 
     @property
     def can_run_automatic_feedback(self) -> bool:
@@ -734,9 +849,13 @@ class SLMSession:
         grid_y: int,
         period_x_px: float,
         period_y_px: float,
-        on_finished: Callable[[bool,Exception | None,Mapping[str,Any] | None],None] | None=None,
+        on_finished: Callable[[bool,Exception | None,GeometryCalibrationPayload | None],None] | None=None,
     ) -> bool:
-        """Compute an isolated calibration CGH without committing experiment state."""
+        """Compute a detached geometry target and return its frame/localization payload.
+
+        The feedback workflow owns uploading this frame and restoring the
+        experiment afterward. This method does not commit experiment CGH state.
+        """
         self._require_active()
         self._require_editor_mode()
         self._require_section(section_key)
@@ -766,7 +885,9 @@ class SLMSession:
         self._active_cgh_requests[section_key]=active
         self._notify("on_cgh_computing_changed",section_key,True)
 
-        def finish(success,error,payload=None):
+        def finish(
+            success: bool,error: Exception | None,payload: GeometryCalibrationPayload | None=None,
+        ) -> None:
             current=self._active_cgh_requests.get(section_key)
             if current is None or current.request_id != request_id:
                 return
@@ -779,7 +900,7 @@ class SLMSession:
                 if not candidate.commit_cgh(result):
                     raise RuntimeError("Transient geometry CGH could not be committed")
                 frame=self.runtime.compose_transient_section_frame(section_key,candidate)
-                payload={
+                payload: GeometryCalibrationPayload={
                     "frame":frame,
                     "localization_context":candidate.get_feedback_localization_context(),
                     "target_intensities":np.array(job.resolution.spot_intensities,copy=True),
@@ -1016,6 +1137,12 @@ class SLMSession:
             on_section_changed=lambda key:self._notify(
                 "on_section_refresh_requested",key,
             ),
+            on_feedback_state_changed=lambda key:self._notify(
+                "on_feedback_state_changed",key,
+            ),
+            on_position_reference_changed=lambda key:self._notify(
+                "on_position_reference_changed",key,
+            ),
             on_transition_committed=lambda key,transition:
                 self._handle_committed_transition(key,transition),
             on_measurement_busy_changed=lambda key,busy,message:self._notify(
@@ -1044,17 +1171,16 @@ class SLMSession:
             self.calibration.session_state_changed()
         self._notify("on_automatic_feedback_changed",state)
 
-    def _on_calibration_planes_changed(self) -> None:
-        # A plane switch changes which saved feedback orientation applies.
-        # Preserve transient test values while the plane is unchanged, but
-        # discard them when the active plane context actually changes.
-        self.feedback.refresh_feedback_orientation_contexts()
-        self.feedback.refresh_fov_position_calibration_contexts()
-        self._notify("on_calibration_planes_changed")
+    def _on_calibration_mappings_changed(self) -> None:
+        # FOV runtime state is mapping-scoped. Observation orientation/geometry
+        # are independent and must not be refreshed here.
+        if not self._config_fov_restore_active:
+            self.fov_mapping_runtime.refresh_fov_mapping_contexts()
+        self._notify("on_calibration_mappings_changed")
 
     def _calibration_callbacks(self) -> SLMCalibrationCallbacks:
         return SLMCalibrationCallbacks(
-            on_planes_changed=self._on_calibration_planes_changed,
+            on_mappings_changed=self._on_calibration_mappings_changed,
             on_state_changed=lambda key:self._notify(
                 "on_calibration_state_changed",key,
             ),
@@ -1128,7 +1254,12 @@ class SLMSession:
         if self._disposed:
             return
         self.feedback.dispose()
+        self.fov_mapping_runtime.dispose()
         self.calibration.dispose()
+        self.geometry_calibration.dispose()
+        self.observation_registration_calibration.dispose()
+        for section_key in tuple(self.runtime.section_keys):
+            self.fov_calibration.discard(section_key)
         self.cancel_all_cgh()
         if self._owns_cgh_executor:
             dispose = getattr(self._cgh_executor,"dispose",None)

@@ -632,6 +632,14 @@ class SLMSectionRuntime:
         )
         self._cgh_session = candidate
 
+    def clear_feedback_measurement(self) -> bool:
+        """Invalidate current measurement-side state without touching CGH state."""
+        candidate = self._cgh_session.clone()
+        changed = candidate.clear_feedback_measurement()
+        if changed:
+            self._cgh_session = candidate
+        return changed
+
     def update_feedback_parameters(
         self,group: str,changes: Mapping[str,Any],
     ) -> bool:
@@ -642,10 +650,11 @@ class SLMSectionRuntime:
             self._cgh_session = candidate
         return changed
 
-    def get_feedback_localization_context(self):
+    def get_feedback_localization_context(self,*,pixel_size_um: float | None=None):
         candidate = self._cgh_session.clone()
         return candidate.feedback_localization_context(
             self.state.cgh,self._build_context(self.state),
+            pixel_size_um=pixel_size_um,
         )
 
     def get_base_target_localization_reference(
@@ -806,18 +815,22 @@ class SLMSectionRuntime:
             reference_positions_px=reference_positions_px,
         )
 
-    def get_fov_position_context(self):
-        return self._cgh_session.fov_position_context(
+    def get_fov_mapping_context(self):
+        return self._cgh_session.fov_mapping_context(
             self.state.cgh,self._build_context(self.state),
         )
 
-    def set_fov_position_calibration(self,calibration) -> bool:
+    def set_fov_mapping_correction(self,calibration) -> bool:
         candidate = self._cgh_session.clone()
-        effective_changed = candidate.set_fov_position_calibration(
+        effective_changed = candidate.set_fov_mapping_correction(
             self.state.cgh,self._build_context(self.state),calibration,
         )
         self._commit_feedback_session(candidate,effective_changed)
         return effective_changed
+
+    def restore_fov_mapping_correction(self,calibration) -> None:
+        """Restore config-owned FOV context without invalidating saved rounds."""
+        self._cgh_session.restore_fov_mapping_correction(calibration)
 
     def set_position_correction_active(
         self,active: bool,*,reset_intensity: bool=False,
@@ -886,6 +899,17 @@ class SLMSectionRuntime:
 
         candidate = self.state.clone()
         normalized_values = candidate.apply_requested_values(changes)
+
+        target_state = candidate.cgh.items[committed.target_type]
+        lock = target_state.lock_state
+        if lock is not None and getattr(lock,"kind",None) is None:
+            setter = getattr(lock,"set_period_fov_reference",None)
+            if callable(setter):
+                setter((
+                    committed.canonical_params["fov_x_px"],
+                    committed.canonical_params["fov_y_px"],
+                ))
+
         return self._apply_candidate_transaction(
             candidate,
             normalized_values=normalized_values,

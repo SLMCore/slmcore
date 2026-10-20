@@ -43,6 +43,7 @@ def localization_context(
     target_params: Mapping[str,Any],
     resolution: TargetResolution,
     calibration: Any=None,
+    pixel_size_um: float | None=None,
 ) -> Mapping[str,Any]:
     """Resolve target-derived hints that are safe to expose to localization.
 
@@ -60,7 +61,9 @@ def localization_context(
         else "lattice"
     )
     target_stagger = _target_stagger_hint(target_params,resolution)
-    target_period = _target_detector_period_hint(resolution,calibration)
+    target_period = _target_detector_period_hint(
+        resolution,calibration,pixel_size_um=pixel_size_um,
+    )
     target_count = _target_lattice_size_hint(resolution)
 
     return {
@@ -95,6 +98,7 @@ def resolve_localization_guidance(
     resolution: TargetResolution,
     calibration: Any,
     parameters: Mapping[str,Any],
+    pixel_size_um: float | None=None,
 ) -> LocalizationGuidance:
     """Resolve target/manual/auto inputs into detector-space lattice guidance.
 
@@ -116,8 +120,8 @@ def resolve_localization_guidance(
     )
     if stagger_mode == "manual":
         stagger = float(parameters["manual_stagger"])
-        if not np.isfinite(stagger) or not 0.0 <= stagger <= 1.0:
-            raise ValueError("manual_stagger must be in [0, 1]")
+        if not np.isfinite(stagger) or not -1.0 <= stagger <= 1.0:
+            raise ValueError("manual_stagger must be in [-1, 1]")
         stagger_source = "manual"
     elif stagger_mode == "target":
         stagger = _target_stagger_hint(target_params,resolution)
@@ -143,7 +147,9 @@ def resolve_localization_guidance(
             raise ValueError("Manual expected periods must be finite and > 0")
         period_source = "manual"
     elif period_mode == "target":
-        expected_period = _target_detector_period_hint(resolution,calibration)
+        expected_period = _target_detector_period_hint(
+            resolution,calibration,pixel_size_um=pixel_size_um,
+        )
         period_source = (
             "target_calibration"
             if expected_period is not None
@@ -217,7 +223,7 @@ def _target_stagger_hint(
             value = float(source["stagger"])
         except Exception:
             continue
-        if np.isfinite(value) and 0.0 <= value <= 1.0:
+        if np.isfinite(value) and -1.0 <= value <= 1.0:
             return value
     return None
 
@@ -244,6 +250,8 @@ def _target_lattice_size_hint(
 def _target_detector_period_hint(
     resolution: TargetResolution,
     calibration: Any,
+    *,
+    pixel_size_um: float | None,
 ) -> tuple[float, float] | None:
     """Predict camera-space primitive period lengths without rotation/skew."""
     if calibration is None:
@@ -251,7 +259,6 @@ def _target_detector_period_hint(
     validator = getattr(calibration,"is_valid",None)
     if not callable(validator) or not validator():
         return None
-    pixel_size_um = getattr(calibration,"cam_px_size_um",None)
     if pixel_size_um is None or float(pixel_size_um) <= 0:
         return None
 

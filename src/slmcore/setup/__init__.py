@@ -5,8 +5,8 @@ from .io import (
 )
 from .model import SLMDefinition,SLMHardwareConfig,SLMSectionsDefinition
 from .preferences import (
-    FeedbackOrientationPreferences,FOVPositionCalibrationPreferences,
-    SLMStartupPreferences,
+    FeedbackOrientationPreferences,FOVMappingCorrectionPreferences,
+    FocusedEditingPreferences,SLMStartupPreferences,
 )
 
 __all__ = [
@@ -15,7 +15,8 @@ __all__ = [
     "SLMHardwareConfig",
     "SLMSectionsDefinition",
     "FeedbackOrientationPreferences",
-    "FOVPositionCalibrationPreferences",
+    "FOVMappingCorrectionPreferences",
+    "FocusedEditingPreferences",
     "SLMStartupPreferences",
     "load_slm_setup_file",
     "save_slm_startup_preferences",

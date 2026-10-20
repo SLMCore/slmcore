@@ -15,6 +15,7 @@ import numpy as np
 from ...measurement import ImageMeasurement
 from ..targets.resolution import TargetResolution
 from .api import localize_lattice
+from .ordering import canonicalize_registration
 from .guidance import (
     _target_lattice_size_hint,
     _validated_lattice_indices,
@@ -26,6 +27,44 @@ from .model import (
     LocalizationResult,
     SpotDetectionOptions,
 )
+
+
+def localization_site_masks(
+    localization: LocalizationResult,
+) -> tuple[np.ndarray,np.ndarray,np.ndarray]:
+    """Return genuine, inferred and resolved lattice-site masks.
+
+    Older localization results had no explicit masks and were complete by
+    construction.  Inferred sites are accepted detector-space coordinates for
+    operational feedback, while ``matched`` remains the provenance marker for
+    genuine detector observations.
+    """
+    if not isinstance(localization,LocalizationResult):
+        raise TypeError("localization must be a LocalizationResult")
+    total = int(localization.lattice_indices.shape[1])
+    diagnostics = dict(localization.diagnostics or {})
+
+    matched_value = diagnostics.get("matched_mask")
+    matched = (
+        np.ones(total,dtype=bool)
+        if matched_value is None
+        else np.asarray(matched_value,dtype=bool)
+    )
+    if matched.shape != (total,):
+        raise RuntimeError("Localization matched-mask shape is inconsistent")
+
+    inferred_value = diagnostics.get("inferred_mask")
+    inferred = (
+        np.zeros(total,dtype=bool)
+        if inferred_value is None
+        else np.asarray(inferred_value,dtype=bool)
+    )
+    if inferred.shape != (total,):
+        raise RuntimeError("Localization inferred-mask shape is inconsistent")
+    if np.any(matched & inferred):
+        raise RuntimeError("Localization matched and inferred masks overlap")
+    return matched,inferred,matched | inferred
+
 
 def localize_measurement(
     measurement: ImageMeasurement,
@@ -48,6 +87,7 @@ def localize_measurement(
         resolution=resolution,
         calibration=calibration,
         parameters=parameters,
+        pixel_size_um=measurement.pixel_size_um,
     )
     if hints.geometry_type != "lattice":
         raise ValueError(
@@ -69,7 +109,7 @@ def localize_measurement(
 
     detection_options = SpotDetectionOptions(
         crop_threshold=float(parameters["crop_threshold"]),
-        dilation_kernel_size=int(parameters["dilation_kernel_size"]),
+        crop_margin_px=int(parameters["crop_margin_px"]),
         blur_sigma=float(parameters["spot_blur_sigma"]),
         threshold_rel=float(parameters["spot_threshold_rel"]),
         min_distance_fraction=float(parameters["spot_min_distance_fraction"]),
@@ -79,6 +119,7 @@ def localize_measurement(
     registration_options = LatticeRegistrationOptions(
         expected_period_px=hints.expected_period_px,
         period_tolerance_fraction=float(parameters["period_tolerance_fraction"]),
+        registration_mode=str(parameters["registration_mode"]),
         fft_exclude_fraction=float(parameters["fft_exclude_fraction"]),
         fft_peak_count=int(parameters["fft_peak_count"]),
         lattice_candidate_search_mode=str(
@@ -98,6 +139,10 @@ def localize_measurement(
         detection_options=detection_options,
         registration_options=registration_options,
     )
+    # Registration determines the physical fit.  Normalize only the discrete
+    # finite-grid identity convention afterwards so equivalent fits cannot
+    # randomly flip their spot numbering between acquisitions.
+    registration = canonicalize_registration(registration)
 
     linear = np.asarray(registration.affine_linear,dtype=np.float64)
     translation = np.asarray(registration.affine_translation,dtype=np.float64)
@@ -120,6 +165,11 @@ def localize_measurement(
             "stagger_source",hints.stagger_source
         ),
         "canonical_stagger":registration.diagnostics.get("canonical_stagger"),
+        "lattice_representation":(
+            None
+            if registration.model.representation is None
+            else registration.model.representation.to_dict()
+        ),
         "expected_period_px":(
             None if hints.expected_period_px is None
             else tuple(float(value) for value in hints.expected_period_px)
@@ -139,6 +189,24 @@ def localize_measurement(
         "registration_search_path":registration.diagnostics.get("search_path"),
         "registration_fallback_used":bool(
             registration.diagnostics.get("fallback_used",False)
+        ),
+        "spot_ordering_mode":registration.diagnostics.get(
+            "spot_ordering_mode","auto"
+        ),
+        "spot_ordering":registration.diagnostics.get(
+            "spot_ordering","canonical"
+        ),
+        "spot_ordering_registration_transform":registration.diagnostics.get(
+            "spot_ordering_registration_transform","canonical"
+        ),
+        "spot_ordering_detector_frame":registration.diagnostics.get(
+            "spot_ordering_detector_frame","canonical"
+        ),
+        "spot_ordering_available":tuple(
+            registration.diagnostics.get("spot_ordering_available",("canonical",))
+        ),
+        "ordering_logical_positions":registration.diagnostics.get(
+            "ordering_logical_positions"
         ),
         "detected_spot_count":int(registration.detections.positions_px.shape[1]),
         "matched_count":int(np.count_nonzero(registration.matched_mask)),

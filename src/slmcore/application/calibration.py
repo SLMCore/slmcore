@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass,field
+from dataclasses import dataclass,field,replace
+import math
 from typing import Any,Callable,Mapping
 
 from ..core.calibration.geometry import (
@@ -9,11 +10,16 @@ from ..core.calibration.geometry import (
 )
 from ..core.calibration.slm_section_calibration import SLMSectionCalibration
 from ..workspace.calibration_store import SLMCalibrationStore
+from .mapping import MappingService
+from .observation import ObservationPlaneService
+from .observation_geometry import ObservationGeometryService
 from ..core.calibration.target_localization_calibration import (
     TargetLocalizationCalibrationCandidate,fit_target_localization_calibration,
 )
 from ..core.cgh.execution.status import CGHResultState
-from ..core.cgh.localization.parameters import LOCALIZATION_PARAMS
+from ..core.cgh.localization.parameters import (
+    LOCALIZATION_PARAMS,normalize_localization_parameter_input,
+)
 from ..core.cgh.localization.policy import suggest_localization_sources
 from ..core.cgh.localization.reference import TargetLocalizationReference
 from ..core.cgh.localization.workflow import localize_measurement
@@ -36,7 +42,7 @@ def _default_localization_parameters() -> dict[str,Any]:
 def _validated_localization_parameters(
     values: Mapping[str,Any],
 ) -> dict[str,Any]:
-    values = dict(values or {})
+    values = normalize_localization_parameter_input(values)
     unknown = set(values) - set(LOCALIZATION_PARAMS)
     if unknown:
         raise KeyError(
@@ -52,7 +58,11 @@ def _validated_localization_parameters(
 class TargetCalibrationState:
     """Transient target-localization calibration workflow state."""
 
-    plane_name: str | None=None
+    section_key: str=""
+    mapping_name: str | None=None
+    observation_plane_name: str | None=None
+    source: str | None=None
+    pixel_size_um_override: float | None=None
     measurement: ImageMeasurement | None=None
     localization_parameters: dict[str,Any]=field(default_factory=dict)
     reference: TargetLocalizationReference | None=None
@@ -62,11 +72,11 @@ class TargetCalibrationState:
 
 
 @dataclass(frozen=True)
-class PreparedPlaneSelection:
-    """Side-effect-free description of one requested active-plane change."""
+class PreparedMappingSelection:
+    """Side-effect-free description of one requested active-mapping change."""
 
     section_key: str
-    plane_name: str | None
+    mapping_name: str | None
     calibration: SLMSectionCalibration | None
     calibration_mismatches: tuple[CalibrationGeometryMismatch,...]=()
 
@@ -87,7 +97,7 @@ class CalibrationAcquisitionAvailability:
 class SLMCalibrationCallbacks:
     """Presentation-neutral events emitted by :class:`SLMCalibrationService`."""
 
-    on_planes_changed: Callable[[],None]=_noop
+    on_mappings_changed: Callable[[],None]=_noop
     on_state_changed: Callable[[str],None]=_noop
     on_measurement_busy_changed: Callable[[str,bool,str],None]=_noop
     on_measurement_error: Callable[[str,Exception],None]=_noop
@@ -96,13 +106,16 @@ class SLMCalibrationCallbacks:
 
 
 class SLMCalibrationService:
-    """Toolkit-independent calibration/plane workflow for one SLM session."""
+    """Toolkit-independent calibration/mapping workflow for one SLM session."""
 
     def __init__(
         self,
         session,
         *,
         store: SLMCalibrationStore | None=None,
+        mappings: MappingService | None=None,
+        observation_planes: ObservationPlaneService | None=None,
+        observation_geometry: ObservationGeometryService | None=None,
         preferences=None,
         display_name: str="",
         measurements: MeasurementDispatcher | None=None,
@@ -110,24 +123,27 @@ class SLMCalibrationService:
     ) -> None:
         self.session = session
         self.store = store
+        self.mappings = mappings or MappingService()
+        self.observation_planes = observation_planes or ObservationPlaneService()
+        self.observation_geometry = observation_geometry
         self.preferences = preferences
         self.display_name = str(display_name or session.runtime.identity.key)
         self.measurements = measurements
         self._callbacks = callbacks or SLMCalibrationCallbacks()
         self._states: dict[str,TargetCalibrationState] = {}
         self._requests: dict[str,MeasurementRequest] = {}
-        self._active_planes: dict[str,str] = {}
+        self._active_mappings: dict[str,str] = {}
         self._generation = 0
         self._store_change_pending = False
         self._disposed = False
-        if self.store is not None:
-            self.store.add_listener(self._on_store_changed)
-            if self.store.last_load_error is not None:
+        if self.mappings.store is not None:
+            self.mappings.add_listener(self._on_store_changed)
+            if self.mappings.last_load_error is not None:
                 self._warning(
-                    "SLM calibration",
-                    "Could not load plane definitions: %s" % self.store.last_load_error,
+                    "SLM mapping",
+                    "Could not load mapping definitions: %s" % self.mappings.last_load_error,
                 )
-        self._synchronize_active_planes_from_runtime()
+        self._synchronize_active_mappings_from_runtime()
 
     def set_callbacks(self,callbacks: SLMCalibrationCallbacks | None) -> None:
         self._callbacks = callbacks or SLMCalibrationCallbacks()
@@ -141,58 +157,60 @@ class SLMCalibrationService:
         self.measurements = measurements
 
     @property
-    def plane_names(self) -> tuple[str,...]:
-        return () if self.store is None else self.store.plane_names
+    def mapping_names(self) -> tuple[str,...]:
+        return self.mappings.names
 
     @property
-    def last_store_load_error(self) -> Exception | None:
-        return None if self.store is None else self.store.last_load_error
+    def last_mapping_store_load_error(self) -> Exception | None:
+        return self.mappings.last_load_error
 
-    def plane_definition(self,plane_name: str) -> dict[str,Any]:
-        return self._require_store().plane_definition(plane_name)
+    def mapping_definition(self,mapping_name: str):
+        return self._require_mappings().get(mapping_name)
 
-    def active_plane(self,section_key: str) -> str | None:
+    def active_mapping(self,section_key: str) -> str | None:
         self._require_section(section_key)
-        plane = str(self._active_planes.get(section_key) or "").strip()
-        if plane and self.store is not None and self.store.has_plane(plane):
-            return plane
+        mapping = str(self._active_mappings.get(section_key) or "").strip()
+        if mapping and self.mappings.has(mapping):
+            return mapping
         return None
 
-    def _synchronize_active_planes_from_runtime(self) -> None:
-        """Reconcile independent plane selection after construction/runtime replacement."""
+    def _synchronize_active_mappings_from_runtime(self) -> None:
+        """Reconcile independent mapping selection after construction/runtime replacement."""
         runtime = self.session.runtime
-        previous = dict(self._active_planes)
+        previous = dict(self._active_mappings)
         active: dict[str,str] = {}
         for section_key in runtime.section_keys:
             calibration = runtime.get_section_calibration_copy(section_key)
-            plane = str(getattr(calibration,"plane",None) or "").strip()
-            if plane and self.store is not None and self.store.has_plane(plane):
-                active[section_key] = plane
+            mapping = str(getattr(calibration,"mapping_name",None) or "").strip()
+            if mapping and self.mappings.has(mapping):
+                active[section_key] = mapping
                 continue
             prior = str(previous.get(section_key) or "").strip()
-            if prior and self.store is not None and self.store.has_plane(prior):
+            if prior and self.mappings.has(prior):
                 active[section_key] = prior
                 continue
             preferred = (
                 None if self.preferences is None
-                else self.preferences.default_plane(section_key)
+                else self.preferences.default_mapping(section_key)
             )
             preferred = str(preferred or "").strip()
-            if preferred and self.store is not None and self.store.has_plane(preferred):
+            if preferred and self.mappings.has(preferred):
                 active[section_key] = preferred
-        self._active_planes = active
+        self._active_mappings = active
 
-    def prepare_plane_selection(
-        self,section_key: str,plane_name: str | None,
-    ) -> PreparedPlaneSelection:
+    def prepare_mapping_selection(
+        self,section_key: str,mapping_name: str | None,
+    ) -> PreparedMappingSelection:
         self._require_editor_mode()
         self._require_section(section_key)
         store = self._require_store()
-        plane = str(plane_name or "").strip() or None
+        mapping = str(mapping_name or "").strip() or None
+        if mapping is not None:
+            self._require_mappings().get(mapping)
         calibration = (
-            None if plane is None
+            None if mapping is None
             else store.load_calibration(
-                self.session.runtime.identity,section_key,plane,
+                self.session.runtime.identity,section_key,mapping,
             )
         )
         if calibration is not None and not calibration.is_valid():
@@ -202,24 +220,24 @@ class SLMCalibrationService:
             self.session.runtime.get_section_geometry(section_key),
             calibration,
         ),))
-        return PreparedPlaneSelection(
+        return PreparedMappingSelection(
             section_key=section_key,
-            plane_name=plane,
+            mapping_name=mapping,
             calibration=calibration,
             calibration_mismatches=tuple(mismatches),
         )
 
-    def select_plane(
+    def select_mapping(
         self,
-        prepared: PreparedPlaneSelection,
+        prepared: PreparedMappingSelection,
         *,
         calibration_mismatch_policy: CalibrationMismatchPolicy | str=(
             CalibrationMismatchPolicy.REJECT
         ),
     ) -> bool:
         self._require_editor_mode()
-        if not isinstance(prepared,PreparedPlaneSelection):
-            raise TypeError("prepared must be a PreparedPlaneSelection")
+        if not isinstance(prepared,PreparedMappingSelection):
+            raise TypeError("prepared must be a PreparedMappingSelection")
         self._require_section(prepared.section_key)
         policy = CalibrationMismatchPolicy.normalize(calibration_mismatch_policy)
         if prepared.calibration_mismatches and policy is not CalibrationMismatchPolicy.KEEP:
@@ -232,90 +250,132 @@ class SLMCalibrationService:
         previous_calibration = self.session.runtime.get_section_calibration_copy(section_key)
         previous_default = (
             None if self.preferences is None
-            else self.preferences.default_plane(section_key)
+            else self.preferences.default_mapping(section_key)
         )
-        previous_active = self.active_plane(section_key)
+        previous_active = self.active_mapping(section_key)
         try:
             self.session.set_section_calibration(section_key,prepared.calibration)
-            if prepared.plane_name is None:
-                self._active_planes.pop(section_key,None)
+            if prepared.mapping_name is None:
+                self._active_mappings.pop(section_key,None)
             else:
-                self._active_planes[section_key] = prepared.plane_name
+                self._active_mappings[section_key] = prepared.mapping_name
             if self.preferences is not None:
-                self.preferences.set_default_plane(section_key,prepared.plane_name)
-            if prepared.plane_name != previous_active:
+                self.preferences.set_default_mapping(section_key,prepared.mapping_name)
+            if prepared.mapping_name != previous_active:
                 self.discard_target_state(section_key)
-            self._callbacks.on_planes_changed()
+            self._callbacks.on_mappings_changed()
             return True
         except Exception:
             try:
                 self.session.set_section_calibration(section_key,previous_calibration)
                 if previous_active is None:
-                    self._active_planes.pop(section_key,None)
+                    self._active_mappings.pop(section_key,None)
                 else:
-                    self._active_planes[section_key] = previous_active
+                    self._active_mappings[section_key] = previous_active
                 if self.preferences is not None:
-                    self.preferences.set_default_plane(section_key,previous_default)
+                    self.preferences.set_default_mapping(section_key,previous_default)
             except Exception as rollback_error:
-                self._error("SLM plane selection rollback failed",rollback_error)
-            self._callbacks.on_planes_changed()
+                self._error("SLM mapping selection rollback failed",rollback_error)
+            self._callbacks.on_mappings_changed()
             raise
 
-    def add_plane(self,definition: Mapping[str,Any]) -> str:
+    def add_mapping(self,definition: Mapping[str,Any]) -> str:
         self._require_editor_mode()
-        return self._require_store().add_plane(dict(definition or {}))
+        return self._require_mappings().add(dict(definition or {})).name
 
-    def delete_plane(self,plane_name: str) -> tuple[str,...]:
+    def delete_mapping(self,mapping_name: str) -> tuple[str,...]:
+        """Delete a mapping profile and every persistent resource it owns.
+
+        The mapping definition is removed last so catalog reconciliation can
+        clear active runtime mapping/FOV state only after dependent persistent
+        records and defaults have been removed.
+        """
         self._require_editor_mode()
-        return self._require_store().delete_plane(plane_name)
+        mappings = self._require_mappings()
+        name = mappings.get(mapping_name).name
+        if self.preferences is not None:
+            self.preferences.remove_mapping(name)
+        mappings.delete_fov_corrections_for_mapping(name)
+        deleted = self._require_store().delete_mapping_calibrations(name)
+        mappings.delete(name)
+        return deleted
+
+    def saved_calibration(
+        self,section_key: str,mapping_name: str,
+    ) -> SLMSectionCalibration:
+        """Load one persisted base calibration without changing active mapping state."""
+        self._require_section(section_key)
+        mapping = str(mapping_name or "").strip()
+        if not mapping:
+            raise ValueError("mapping_name must not be empty")
+        self.mapping_definition(mapping)
+        return self._require_store().load_calibration(
+            self.session.runtime.identity,str(section_key),mapping,
+        )
+
+    def delete_mapping_calibration(
+        self,section_key: str,mapping_name: str,
+    ) -> str | None:
+        """Delete one persisted base calibration while preserving the mapping profile."""
+        self._require_editor_mode()
+        self._require_section(section_key)
+        mapping = str(mapping_name or "").strip()
+        if not mapping:
+            raise ValueError("mapping_name must not be empty")
+        self.mapping_definition(mapping)
+        if self.active_mapping(section_key) == mapping:
+            return self.delete_calibration(section_key)
+        return self._require_store().delete_calibration(
+            self.session.runtime.identity,str(section_key),mapping,
+        )
 
     def delete_calibration(self,section_key: str) -> str | None:
-        """Delete only the active plane calibration, preserving plane selection."""
+        """Delete only the active mapping calibration, preserving mapping selection."""
         self._require_editor_mode()
         self._require_section(section_key)
         store = self._require_store()
-        plane = self.active_plane(section_key)
-        if not plane:
-            raise RuntimeError("Select a calibration plane before deleting calibration.")
+        mapping = self.active_mapping(section_key)
+        if not mapping:
+            raise RuntimeError("Select a mapping before deleting calibration.")
         runtime = self.session.runtime
         previous_calibration = runtime.get_section_calibration_copy(section_key)
         try:
             deleted = store.delete_calibration(
-                runtime.identity,section_key,plane,
+                runtime.identity,section_key,mapping,
             )
             self.session.set_section_calibration(section_key,None)
             self.discard_target_state(section_key)
-            self._callbacks.on_planes_changed()
+            self._callbacks.on_mappings_changed()
             return deleted
         except Exception:
             if previous_calibration is not None and previous_calibration.is_valid():
                 try:
                     restored = store.save_calibration(
-                        runtime.identity,section_key,plane,previous_calibration,
+                        runtime.identity,section_key,mapping,previous_calibration,
                     )
                     self.session.set_section_calibration(section_key,restored)
                 except Exception as rollback_error:
                     self._error("SLM calibration deletion rollback failed",rollback_error)
-            self._callbacks.on_planes_changed()
+            self._callbacks.on_mappings_changed()
             raise
 
     def apply_startup_defaults(self) -> None:
-        if self.store is None or self.preferences is None:
+        if self.store is None or self.preferences is None or self.mappings.store is None:
             return
         runtime = self.session.runtime
         for section_key in runtime.section_keys:
-            plane = self.preferences.default_plane(section_key)
-            if not plane:
+            mapping = self.preferences.default_mapping(section_key)
+            if not mapping:
                 continue
-            if not self.store.has_plane(plane):
+            if not self.mappings.has(mapping):
                 try:
-                    self.preferences.set_default_plane(section_key,None)
+                    self.preferences.set_default_mapping(section_key,None)
                 except Exception as error:
                     self._error("SLM calibration preference failed",error)
                 continue
             try:
                 calibration = self.store.load_calibration(
-                    runtime.identity,section_key,plane,
+                    runtime.identity,section_key,mapping,
                 )
                 if not calibration.is_valid():
                     calibration = None
@@ -333,28 +393,107 @@ class SLMCalibrationService:
                 self.session.set_section_calibration(
                     section_key,calibration,publish_frame=False,
                 )
-                self._active_planes[section_key] = plane
+                self._active_mappings[section_key] = mapping
             except Exception as error:
                 self._warning(
                     "SLM calibration",
                     "Could not apply default calibration for %s/%s: %s"
                     % (self.display_name,section_key,error),
                 )
-        self._callbacks.on_planes_changed()
+        self._callbacks.on_mappings_changed()
 
     def target_state(self,section_key: str) -> TargetCalibrationState | None:
         return self._states.get(section_key)
 
-    def ensure_target_reference(self,section_key: str) -> TargetCalibrationState:
+    def observation_plane_names(self) -> tuple[str,...]:
+        return tuple(item.name for item in self.observation_planes.list())
+
+    def ensure_target_context(self,section_key: str) -> TargetCalibrationState:
+        """Return/create mapping-calibration workflow state for one section.
+
+        Observation selection is calibration-workflow state.  It is deliberately
+        independent from Feedback's observation selection and from mapping
+        identity itself.
+        """
         self._require_editor_mode()
         self._require_section(section_key)
         state = self._states.get(section_key)
+        mapping = self.active_mapping(section_key)
         if state is None:
+            planes = self.observation_planes.list()
+            plane_name = planes[0].name if len(planes) == 1 else None
+            source = None
+            if plane_name is not None:
+                source = self.observation_planes.get(plane_name).preferred_detector
             state = TargetCalibrationState(
-                plane_name=self.active_plane(section_key),
+                section_key=str(section_key),
+                mapping_name=mapping,
+                observation_plane_name=plane_name,
+                source=source,
                 localization_parameters=_default_localization_parameters(),
             )
             self._states[section_key] = state
+        elif state.mapping_name != mapping:
+            state.mapping_name = mapping
+            self._clear_target_measurement_state(state)
+        return state
+
+    def target_observation_plane(self,section_key: str) -> str | None:
+        return self.ensure_target_context(section_key).observation_plane_name
+
+    def select_target_observation_plane(
+        self,section_key: str,observation_plane_name: str | None,
+    ) -> bool:
+        """Select observation context for mapping calibration only."""
+        state = self.ensure_target_context(section_key)
+        selected = str(observation_plane_name or "").strip() or None
+        if selected is not None:
+            plane = self.observation_planes.get(selected)
+        else:
+            plane = None
+        if selected == state.observation_plane_name:
+            return False
+        self.cancel_request(section_key)
+        state.observation_plane_name = selected
+        state.source = None if plane is None else plane.preferred_detector
+        state.pixel_size_um_override = None
+        self._clear_target_measurement_state(state)
+        self._callbacks.on_state_changed(section_key)
+        return True
+
+    def set_target_source(self,section_key: str,source: str | None) -> bool:
+        state = self.ensure_target_context(section_key)
+        selected = str(source or "").strip() or None
+        if selected == state.source:
+            return False
+        self.cancel_request(section_key)
+        state.source = selected
+        self._clear_target_measurement_state(state)
+        self._callbacks.on_state_changed(section_key)
+        return True
+
+    def set_target_pixel_size_override(
+        self,section_key: str,pixel_size_um: float | None,
+    ) -> None:
+        state = self.ensure_target_context(section_key)
+        if pixel_size_um is None:
+            state.pixel_size_um_override = None
+            return
+        value = float(pixel_size_um)
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError("pixel_size_um must be a positive finite value")
+        state.pixel_size_um_override = value
+
+    @staticmethod
+    def _clear_target_measurement_state(state: TargetCalibrationState) -> None:
+        state.measurement = None
+        state.localization = None
+        state.calibration_candidate = None
+
+    def ensure_target_reference(self,section_key: str) -> TargetCalibrationState:
+        self._require_editor_mode()
+        self._require_section(section_key)
+        state = self.ensure_target_context(section_key)
         try:
             reference = self.session.runtime.get_section_base_target_localization_reference(
                 section_key
@@ -455,25 +594,57 @@ class SLMCalibrationService:
                     "before acquiring a calibration image."
                 ),
             )
-        plane = self.active_plane(section_key)
-        if not plane or self.store is None:
+        mapping = self.active_mapping(section_key)
+        if not mapping:
             return CalibrationAcquisitionAvailability(
-                False,reason="Select a calibration plane before live acquisition."
+                False,reason="Select a mapping before live acquisition."
             )
-        detector = str(
-            self.store.plane_definition(plane).get("detector_name") or ""
-        ).strip()
-        if not detector:
+        state = self.ensure_target_context(section_key)
+        plane_name = state.observation_plane_name
+        if not plane_name:
             return CalibrationAcquisitionAvailability(
-                False,reason="The active calibration plane has no detector configured."
+                False,
+                reason="Select an observation plane before live acquisition.",
             )
-        return CalibrationAcquisitionAvailability(True,detector=detector)
+        try:
+            available_sources = tuple(
+                str(value).strip()
+                for value in measurements.available_sources(section_key)
+                if str(value).strip()
+            )
+        except Exception:
+            available_sources = ()
+        source = str(state.source or "").strip() or None
+        if source not in available_sources:
+            preferred = self.observation_planes.get(plane_name).preferred_detector
+            if preferred in available_sources:
+                source = preferred
+            else:
+                try:
+                    source = measurements.preferred_source(section_key,available_sources)
+                except Exception:
+                    source = None
+                source = str(source or "").strip() or None
+                if source not in available_sources:
+                    source = available_sources[0] if available_sources else None
+        return CalibrationAcquisitionAvailability(True,detector=source)
 
     def acquire_target_measurement(
-        self,section_key: str,detector: str | None=None,
+        self,
+        section_key: str,
+        detector: str | None=None,
+        *,
+        pixel_size_um: float | None=None,
     ) -> bool:
         self._require_editor_mode()
-        self.ensure_target_reference(section_key)
+        state = self.ensure_target_reference(section_key)
+        if detector is not None:
+            requested = str(detector or "").strip() or None
+            if requested != state.source:
+                state.source = requested
+                self._clear_target_measurement_state(state)
+        if pixel_size_um is not None:
+            self.set_target_pixel_size_override(section_key,pixel_size_um)
         availability = self.acquisition_availability(section_key)
         if not availability.available:
             raise RuntimeError(availability.reason)
@@ -483,7 +654,9 @@ class SLMCalibrationService:
         detector = str(detector or availability.detector or "").strip()
         if not detector:
             raise RuntimeError("Select a detector before acquisition.")
-        plane = self.active_plane(section_key)
+        mapping = self.active_mapping(section_key)
+        plane_name = state.observation_plane_name
+        state.source = detector
         self.cancel_request(section_key)
         generation = self._generation
         self._callbacks.on_measurement_busy_changed(
@@ -498,7 +671,9 @@ class SLMCalibrationService:
             if not self.session.editor_writes_allowed:
                 return
             try:
-                self.commit_target_measurement(section_key,measurement)
+                self.commit_target_measurement(
+                    section_key,measurement,source=detector,
+                )
             except Exception as error:
                 self._callbacks.on_measurement_error(section_key,error)
 
@@ -517,7 +692,9 @@ class SLMCalibrationService:
             metadata={
                 "slm_key":self.session.runtime.identity.key,
                 "section_key":section_key,
-                "plane_name":plane,
+                "mapping_name":mapping,
+                "observation_plane":plane_name,
+                "source":detector,
                 "calibration_method":"target_localization",
             },
             on_result=on_result,
@@ -528,12 +705,29 @@ class SLMCalibrationService:
         return True
 
     def commit_target_measurement(
-        self,section_key: str,measurement: ImageMeasurement,
+        self,
+        section_key: str,
+        measurement: ImageMeasurement,
+        *,
+        source: str | None=None,
+        pixel_size_um: float | None=None,
     ) -> TargetCalibrationState:
         self._require_editor_mode()
         state = self._states.get(section_key)
         if state is None or state.reference is None:
             raise RuntimeError("Target localization reference is not available.")
+        self._require_target_observation_plane(state)
+        if pixel_size_um is not None:
+            self.set_target_pixel_size_override(section_key,pixel_size_um)
+        measurement = self._resolve_target_measurement_scale(state,measurement)
+        selected_source = str(source or "").strip() or None
+        if selected_source is None:
+            selected_source = (
+                str(measurement.detector or "").strip()
+                or str(measurement.source or "").strip()
+                or None
+            )
+        state.source = selected_source
         state.measurement = measurement
         state.localization = None
         state.calibration_candidate = None
@@ -550,12 +744,21 @@ class SLMCalibrationService:
         return state
 
     def run_target_localization(
-        self,section_key: str,parameters: Mapping[str,Any],
+        self,
+        section_key: str,
+        parameters: Mapping[str,Any],
+        *,
+        pixel_size_um: float | None=None,
     ) -> TargetLocalizationCalibrationCandidate:
         self._require_editor_mode()
         state = self.ensure_target_reference(section_key)
         if state.measurement is None:
             raise RuntimeError("Acquire or load an image before localization.")
+        if pixel_size_um is not None:
+            self.set_target_pixel_size_override(section_key,pixel_size_um)
+        state.measurement = self._resolve_target_measurement_scale(
+            state,state.measurement,require=True,
+        )
         normalized = _validated_localization_parameters(parameters)
         reference = state.reference
         if reference is None:
@@ -571,28 +774,37 @@ class SLMCalibrationService:
         state.localization_parameters = normalized
         state.localization = localization
         state.calibration_candidate = None
-        candidate = self._fit_target_candidate(section_key,state,localization)
+        candidate = self._fit_target_candidate(
+            section_key,state,localization,
+        )
         state.calibration_candidate = candidate
         self._callbacks.on_state_changed(section_key)
         return candidate
 
     def _fit_target_candidate(
-        self,section_key: str,state: TargetCalibrationState,localization: Any,
+        self,
+        section_key: str,
+        state: TargetCalibrationState,
+        localization: Any,
     ) -> TargetLocalizationCalibrationCandidate:
         if state.reference is None:
             raise RuntimeError("Target localization reference is not available.")
-        plane = str(state.plane_name or self.active_plane(section_key) or "").strip()
-        if not plane:
-            raise RuntimeError("Target calibration is not bound to a plane.")
-        store = self._require_store()
-        state.plane_name = plane
-        definition = store.plane_definition(plane)
+        mapping = str(state.mapping_name or self.active_mapping(section_key) or "").strip()
+        if not mapping:
+            raise RuntimeError("Target calibration is not bound to a mapping.")
+        self._require_mappings().get(mapping)
+        state.mapping_name = mapping
         measurement = state.measurement
+        pixel_size_um = None if measurement is None else measurement.pixel_size_um
+        if pixel_size_um is None:
+            raise RuntimeError(
+                "Target-localization calibration requires measurement pixel_size_um."
+            )
         return fit_target_localization_calibration(
             resolution=state.reference.resolution,
             localization=localization,
-            detector_pixel_size_um=float(definition["detector_pixel_size_um"]),
-            plane=plane,
+            detector_pixel_size_um=pixel_size_um,
+            mapping_name=mapping,
             metadata={
                 "slm_key":self.session.runtime.identity.key,
                 "section_key":section_key,
@@ -601,8 +813,57 @@ class SLMCalibrationService:
                 "measurement_id":getattr(measurement,"measurement_id",None),
                 "measurement_source":getattr(measurement,"source",None),
                 "measurement_detector":getattr(measurement,"detector",None),
+                "observation_plane":state.observation_plane_name,
+                "observation_source":state.source,
+                "pixel_size_um":pixel_size_um,
             },
         )
+
+    def _require_target_observation_plane(
+        self,state: TargetCalibrationState,
+    ) -> str:
+        plane_name = str(state.observation_plane_name or "").strip()
+        if not plane_name:
+            raise RuntimeError(
+                "Select an observation plane before target-localization calibration."
+            )
+        self.observation_planes.get(plane_name)
+        return plane_name
+
+    def _resolve_target_measurement_scale(
+        self,
+        state: TargetCalibrationState,
+        measurement: ImageMeasurement,
+        *,
+        require: bool=False,
+    ) -> ImageMeasurement:
+        if not isinstance(measurement,ImageMeasurement):
+            raise TypeError("measurement must be an ImageMeasurement")
+        if measurement.pixel_size_um is not None:
+            return measurement
+        plane_name = self._require_target_observation_plane(state)
+        plane = self.observation_planes.get(plane_name)
+        # An explicit workflow value overrides the observation-plane fallback.
+        # A scale carried by the measurement itself remains authoritative above.
+        pixel_size_um = state.pixel_size_um_override
+        if pixel_size_um is None:
+            pixel_size_um = plane.default_pixel_size_um
+        if pixel_size_um is None:
+            if require:
+                raise RuntimeError(
+                    "Target-localization calibration requires a detector pixel size. "
+                    "Provide it in the measurement, define an observation-plane default, "
+                    "or enter a pixel size for this calibration workflow."
+                )
+            return measurement
+        metadata = dict(measurement.metadata)
+        metadata.setdefault("pixel_size_resolution","observation_or_workflow_fallback")
+        return replace(
+            measurement,
+            pixel_size_um=float(pixel_size_um),
+            metadata=metadata,
+        )
+
 
     @staticmethod
     def linear_phase_calibration(
@@ -616,21 +877,21 @@ class SLMCalibrationService:
             period_x_px,measured_dx_um,period_y_px,measured_dy_um,
         )
 
-    def apply_target_candidate(self,section_key: str,plane_name: str) -> SLMSectionCalibration:
+    def apply_target_candidate(self,section_key: str,mapping_name: str) -> SLMSectionCalibration:
         state = self._states.get(section_key)
         if state is None or state.calibration_candidate is None:
             raise RuntimeError("Run target localization before setting calibration.")
-        plane = str(plane_name or "").strip()
-        if state.plane_name and state.plane_name != plane:
-            raise RuntimeError("Calibration candidate belongs to a different plane.")
+        mapping = str(mapping_name or "").strip()
+        if state.mapping_name and state.mapping_name != mapping:
+            raise RuntimeError("Calibration candidate belongs to a different mapping.")
         return self.apply_and_save_calibration(
-            section_key,plane,state.calibration_candidate.calibration,
+            section_key,mapping,state.calibration_candidate.calibration,
         )
 
     def apply_and_save_calibration(
         self,
         section_key: str,
-        plane_name: str,
+        mapping_name: str,
         calibration: SLMSectionCalibration,
     ) -> SLMSectionCalibration:
         self._require_editor_mode()
@@ -639,38 +900,37 @@ class SLMCalibrationService:
         previous_calibration = runtime.get_section_calibration_copy(section_key)
         previous_default = (
             None if self.preferences is None
-            else self.preferences.default_plane(section_key)
+            else self.preferences.default_mapping(section_key)
         )
-        previous_active = self.active_plane(section_key)
+        previous_active = self.active_mapping(section_key)
         try:
-            definition = store.plane_definition(plane_name)
+            self._require_mappings().get(mapping_name)
             value = SLMSectionCalibration.from_dict(calibration).copy()
-            value.plane = plane_name
-            value.cam_px_size_um = float(definition["detector_pixel_size_um"])
+            value.mapping_name = mapping_name
             value = attach_calibration_geometry(
                 value,runtime.get_section_geometry(section_key),
             )
             self.session.set_section_calibration(section_key,value)
             value = store.save_calibration(
-                runtime.identity,section_key,plane_name,value,
+                runtime.identity,section_key,mapping_name,value,
             )
-            self._active_planes[section_key] = plane_name
+            self._active_mappings[section_key] = mapping_name
             if self.preferences is not None:
-                self.preferences.set_default_plane(section_key,plane_name)
-            self._callbacks.on_planes_changed()
+                self.preferences.set_default_mapping(section_key,mapping_name)
+            self._callbacks.on_mappings_changed()
             return value
         except Exception:
             try:
                 self.session.set_section_calibration(section_key,previous_calibration)
                 if previous_active is None:
-                    self._active_planes.pop(section_key,None)
+                    self._active_mappings.pop(section_key,None)
                 else:
-                    self._active_planes[section_key] = previous_active
+                    self._active_mappings[section_key] = previous_active
                 if self.preferences is not None:
-                    self.preferences.set_default_plane(section_key,previous_default)
+                    self.preferences.set_default_mapping(section_key,previous_default)
             except Exception as rollback_error:
                 self._error("SLM calibration rollback failed",rollback_error)
-            self._callbacks.on_planes_changed()
+            self._callbacks.on_mappings_changed()
             raise
 
     def cancel_request(self,section_key: str) -> None:
@@ -691,10 +951,21 @@ class SLMCalibrationService:
         self._states.clear()
 
     def runtime_replaced(self) -> None:
-        self._synchronize_active_planes_from_runtime()
-        if self._store_change_pending:
-            self.reconcile_pending_catalog_changes()
-        self._callbacks.on_planes_changed()
+        self._synchronize_active_mappings_from_runtime()
+        # A loaded config may carry an embedded calibration whose mapping no
+        # longer exists in the workspace catalog.  The catalog is authoritative:
+        # reconcile every runtime replacement instead of leaving an orphan
+        # calibration active but impossible to select/manage.
+        if self.mappings.store is not None:
+            self._store_change_pending = True
+        if (
+            self._store_change_pending
+            and self.session.editor_writes_allowed
+            and not self.session.automatic_operation_active
+        ):
+            self._reconcile_mapping_catalog()
+            return
+        self._callbacks.on_mappings_changed()
 
     def session_state_changed(self) -> None:
         if self.session.editor_writes_allowed and not self.session.automatic_operation_active:
@@ -703,7 +974,7 @@ class SLMCalibrationService:
     def reconcile_pending_catalog_changes(self) -> None:
         if not self._store_change_pending:
             return
-        self._reconcile_plane_catalog()
+        self._reconcile_mapping_catalog()
 
     def _on_store_changed(self) -> None:
         if self._disposed:
@@ -713,40 +984,53 @@ class SLMCalibrationService:
             or self.session.automatic_operation_active
         ):
             self._store_change_pending = True
-            self._callbacks.on_planes_changed()
+            self._callbacks.on_mappings_changed()
             return
-        self._reconcile_plane_catalog()
+        self._reconcile_mapping_catalog()
 
-    def _reconcile_plane_catalog(self) -> None:
+    def _reconcile_mapping_catalog(self) -> None:
         self._store_change_pending = False
-        if self.store is None:
+        if self.mappings.store is None:
             return
         runtime = self.session.runtime
         try:
             with self.session.defer_frame_upload():
                 for section_key in runtime.section_keys:
                     if self.preferences is not None:
-                        preferred = self.preferences.default_plane(section_key)
-                        if preferred and not self.store.has_plane(preferred):
-                            self.preferences.set_default_plane(section_key,None)
-                    active = str(self._active_planes.get(section_key) or "").strip()
-                    if active and not self.store.has_plane(active):
-                        self._active_planes.pop(section_key,None)
+                        preferred = self.preferences.default_mapping(section_key)
+                        if preferred and not self.mappings.has(preferred):
+                            self.preferences.set_default_mapping(section_key,None)
+                    active = str(self._active_mappings.get(section_key) or "").strip()
+                    if active and not self.mappings.has(active):
+                        self._active_mappings.pop(section_key,None)
                         self.discard_target_state(section_key)
                     calibration = runtime.get_section_calibration_copy(section_key)
-                    calibration_plane = str(
-                        getattr(calibration,"plane",None) or ""
+                    calibration_mapping = str(
+                        getattr(calibration,"mapping_name",None) or ""
                     ).strip()
-                    if calibration_plane and not self.store.has_plane(calibration_plane):
+                    if calibration_mapping and not self.mappings.has(calibration_mapping):
+                        self._warning(
+                            "SLM mapping",
+                            (
+                                'Ignoring embedded calibration for missing mapping "%s" '
+                                'in section "%s".'
+                                % (calibration_mapping,section_key)
+                            ),
+                        )
                         self.session.set_section_calibration(section_key,None)
         except Exception as error:
-            self._error("SLM plane catalog synchronization failed",error)
-        self._callbacks.on_planes_changed()
+            self._error("SLM mapping catalog synchronization failed",error)
+        self._callbacks.on_mappings_changed()
 
     def _require_store(self) -> SLMCalibrationStore:
         if self.store is None:
             raise RuntimeError("Calibration storage is not configured.")
         return self.store
+
+    def _require_mappings(self) -> MappingService:
+        if self.mappings.store is None:
+            raise RuntimeError("Mapping storage is not configured.")
+        return self.mappings
 
     def _require_editor_mode(self) -> None:
         if not self.session.editor_writes_allowed:
@@ -770,14 +1054,14 @@ class SLMCalibrationService:
         if self._disposed:
             return
         self.prepare_runtime_change()
-        if self.store is not None:
-            self.store.remove_listener(self._on_store_changed)
+        if self.mappings.store is not None:
+            self.mappings.remove_listener(self._on_store_changed)
         self._disposed = True
 
 
 __all__ = [
     "CalibrationAcquisitionAvailability",
-    "PreparedPlaneSelection",
+    "PreparedMappingSelection",
     "SLMCalibrationCallbacks",
     "SLMCalibrationService",
     "TargetCalibrationState",

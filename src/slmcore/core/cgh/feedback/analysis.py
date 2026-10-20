@@ -6,7 +6,7 @@ from typing import Any,Mapping
 
 import numpy as np
 
-from ..localization import LocalizationResult
+from ..localization import LocalizationResult,localization_site_masks
 from .model import (
     FeedbackMeasurement,
     PositionAnalysis,
@@ -22,13 +22,13 @@ def analyze_position(
     calibration: Any=None,
     parameters: Mapping[str,Any],
 ) -> PositionAnalysis:
-    """Derive one non-cumulative correction relative to ideal target positions.
+    """Derive one position adjustment relative to the supplied active baseline.
 
     Position correction itself does not require a section calibration.
     The localized target provides the detector-pixel -> target-kxy mapping.
 
-    When a valid calibration with detector pixel size is available, physical
-    position errors in micrometres are also calculated for diagnostics.
+    When the measurement carries a detector pixel size, physical position
+    errors in micrometres are also calculated for diagnostics.
     """
     localization = measurement.localization
     if localization is None:
@@ -101,28 +101,12 @@ def analyze_position(
 
     corrected = baseline + correction_kxy
 
-    # Physical units are diagnostic only. They are available when the
-    # section calibration carries a valid detector pixel size, but are
-    # not required to calculate the correction.
+    # Physical units are diagnostic only. Detector scale belongs to the
+    # measurement/observation side, not to the section mapping calibration.
     error_um = None
-
-    if calibration is not None:
-        validator = getattr(calibration, "is_valid", None)
-        pixel_size_um = getattr(
-            calibration,
-            "cam_px_size_um",
-            None,
-        )
-
-        if (
-            callable(validator)
-            and validator()
-            and pixel_size_um is not None
-            and float(pixel_size_um) > 0
-        ):
-            error_um = (
-                error_px * float(pixel_size_um)
-            )
+    pixel_size_um = measurement.acquisition.pixel_size_um
+    if pixel_size_um is not None and float(pixel_size_um) > 0:
+        error_um = error_px * float(pixel_size_um)
 
     return PositionAnalysis(
         parameters=parameters,
@@ -156,19 +140,13 @@ def _fit_affine(source: np.ndarray,target: np.ndarray):
 def _require_complete_localization(
     localization: LocalizationResult,purpose: str,
 ) -> None:
-    matched = dict(localization.diagnostics or {}).get("matched_mask")
-    if matched is None:
-        # Old localization results were complete by construction.
-        return
-    matched = np.asarray(matched,dtype=bool)
-    if matched.shape != (localization.lattice_indices.shape[1],):
-        raise RuntimeError("Localization matched-mask shape is inconsistent")
-    missing = int(np.count_nonzero(~matched))
+    _matched,_inferred,resolved = localization_site_masks(localization)
+    missing = int(np.count_nonzero(~resolved))
     if missing:
         raise RuntimeError(
             "%s requires a complete target localization; %d of %d target spots "
-            "were not matched. Inspect the localization or adjust its settings."
-            % (purpose,missing,matched.size)
+            "remain unresolved. Match them or use Infer missing first."
+            % (purpose,missing,resolved.size)
         )
 
 

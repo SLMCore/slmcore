@@ -1,76 +1,160 @@
+"""Top-level Qt composition facade for feedback workflows."""
+
 from __future__ import annotations
 
-import logging
-from typing import Any,Mapping,Sequence
+from typing import Any,Mapping,Sequence,TYPE_CHECKING
 
-import numpy as np
-from PIL import Image
-from qtpy import QtCore,QtWidgets
+from qtpy import QtCore
 
 from ....application.feedback import AutomaticFeedbackState
-from ....core.measurement import ImageMeasurement,create_image_measurement
+from ....core.measurement import ImageMeasurement
 from ...cgh.session_window import CGHSessionWindow,MeasurementsAction
+from .actions import FeedbackActionRouter
+from .adaptation import FeedbackAdaptationCoordinator
+from .automatic import AutomaticFeedbackCoordinator
+from .localization import LocalizationCoordinator
+from .measurement import MeasurementCoordinator
+from .references import PositionReferenceCoordinator
+
+if TYPE_CHECKING:
+    from ....core.cgh.localization import LocalizationResult
+    from ....core.cgh.measurement_metrics import IntensityAnalysis
+    from ....core.engine.transition import SectionStateTransition
+    from ..session import SLMQtSession
 
 
-_logger = logging.getLogger(__name__)
+_UNSET = object()
 
 
 class FeedbackCoordinator(QtCore.QObject):
-    """Qt presentation adapter for the application-owned feedback service."""
+    """Compose focused feedback UI coordinators for one Qt SLM session.
 
-    def __init__(self,controller) -> None:
-        super().__init__(controller)
-        self.controller = controller
-        self.service = controller.feedback_service
+    This is the only feedback UI object that owns a reference to
+    :class:`SLMQtSession`. Focused coordinators receive the application feedback
+    facade plus narrow Qt callbacks, so measurement/reference/calibration UI
+    logic cannot navigate the complete Qt session as a service locator.
+    """
+
+    def __init__(self,qt_session: "SLMQtSession") -> None:
+        super().__init__(qt_session)
+        self._qt_session = qt_session
+        self._feedback_service = qt_session.feedback_service
         self._windows: dict[str,CGHSessionWindow] = {}
+
+        flush_section = lambda key:self._qt_session.flush_section(key,propagate=True)
+        synchronize_section = self._qt_session.synchronize_section
+        editor_writes_allowed = lambda:bool(self._qt_session.editor_writes_allowed)
+
+        self._automatic = AutomaticFeedbackCoordinator(
+            self._feedback_service,
+            windows=lambda:tuple(self._windows.items()),
+            window_for=self.window,
+            flush_section=flush_section,
+            set_interaction_locked=self._qt_session._set_section_interaction_locked,
+            emit_operation_changed=self._qt_session.sigAutomaticOperationChanged.emit,
+            report_error=self._error,
+        )
+        self._measurement = MeasurementCoordinator(
+            self._feedback_service,
+            window_for=self.window,
+            flush_section=flush_section,
+            editor_writes_allowed=editor_writes_allowed,
+            report_error=self._error,
+            refresh_automatic_window=self._automatic.apply_state_to_window,
+        )
+        self._localization = LocalizationCoordinator(
+            self._feedback_service,
+            window_for=self.window,
+            synchronize_section=synchronize_section,
+            report_error=self._error,
+        )
+        self._references = PositionReferenceCoordinator(
+            self._feedback_service,
+            window_for=self.window,
+            flush_section=flush_section,
+            synchronize_section=synchronize_section,
+            report_error=self._error,
+        )
+        self._adaptation = FeedbackAdaptationCoordinator(
+            self._feedback_service,
+            window_for=self.window,
+            runtime=lambda:self._qt_session.runtime,
+            flush_section=flush_section,
+            synchronize_section=synchronize_section,
+            editor_writes_allowed=editor_writes_allowed,
+            report_warning=self._warning,
+            report_error=self._error,
+        )
+        self._actions = FeedbackActionRouter(
+            measurement=self._measurement,
+            localization=self._localization,
+            adaptation=self._adaptation,
+            references=self._references,
+            automatic=self._automatic,
+            editor_writes_allowed=editor_writes_allowed,
+            compute_adapted_cgh=self._qt_session.compute_adapted_cgh,
+            show_inspection=self._show_inspection,
+            report_error=self._error,
+        )
 
     @property
     def automatic_operation_active(self) -> bool:
-        return self.service.automatic_operation_active
+        return self._automatic.operation_active
 
     def window(self,section_key: str) -> CGHSessionWindow | None:
         return self._windows.get(section_key)
 
+    # ------------------------------------------------------------------
+    # Window ownership and synchronization
+    # ------------------------------------------------------------------
+
     def open_window(self,section_key: str) -> None:
-        if not self.controller.editor_writes_allowed:
+        if not self._qt_session.editor_writes_allowed:
             return
-        self.controller._require_section(section_key)
+        self._qt_session._require_section(section_key)
         try:
-            self.controller.flush_section(section_key,propagate=True)
+            self._qt_session.flush_section(section_key,propagate=True)
             window = self._windows.get(section_key)
             sources = self.available_sources(section_key)
             current = self.preferred_source(section_key,sources)
+            observation_planes = tuple(
+                plane.name for plane in self._feedback_service.observation_planes()
+            )
+            current_observation = (
+                self._feedback_service.active_observation_plane(section_key)
+            )
             if window is None:
-                parent = self.controller.section_collection.section_view(
+                session_inspection=(
+                    self._qt_session.runtime.get_section_cgh_session_inspection(
+                        section_key
+                    )
+                )
+                parent = self._qt_session.section_collection.section_view(
                     section_key
                 ).window()
                 window = CGHSessionWindow(
-                    status=self.controller.runtime.get_section_feedback_status(
+                    status=self._qt_session.runtime.get_section_feedback_status(
                         section_key
                     ),
                     inspection=(
-                        self.controller.runtime.get_section_feedback_inspection(
+                        self._qt_session.runtime.get_section_feedback_inspection(
                             section_key
                         )
                     ),
-                    session_inspection=(
-                        self.controller.runtime.get_section_cgh_session_inspection(
-                            section_key
-                        )
-                    ),
-                    cgh_status=self.controller.runtime.get_section_cgh_status(
+                    session_inspection=session_inspection,
+                    cgh_status=self._qt_session.runtime.get_section_cgh_status(
                         section_key
                     ),
                     localization_context=self.localization_context(section_key),
                     detectors=sources,
                     current_detector=current,
-                    feedback_orientation=self.service.feedback_orientation(section_key),
-                    feedback_orientation_context=(
-                        self._feedback_orientation_ui_context(section_key)
+                    observation_planes=observation_planes,
+                    current_observation_plane=current_observation,
+                    cgh_summary=self.measurements_cgh_summary(
+                        section_key,inspection=session_inspection,
                     ),
-                    cgh_summary=self.measurements_cgh_summary(section_key),
                     title="CGH Session - %s/%s" % (
-                        self.controller.presenter.display_name,section_key,
+                        self._qt_session.presenter.display_name,section_key,
                     ),
                     parent=parent,
                 )
@@ -79,21 +163,26 @@ class FeedbackCoordinator(QtCore.QObject):
                     lambda action,options,key=section_key:
                         self._on_action(key,action,options)
                 )
+                window.sigDefineObservationPlaneRequested.connect(
+                    lambda key=section_key:self._define_observation_plane(key)
+                )
                 window.destroyed.connect(
                     lambda _obj=None,key=section_key:
                         self._windows.pop(key,None)
                 )
-                self._synchronize_position_reference(section_key,window)
-                self._synchronize_fov_position_calibration(section_key,window)
-                self._synchronize_geometry_orientation_calibration(section_key,window)
+                self._references.synchronize(section_key,window,lightweight=True)
+                self._synchronize_geometry_warning(section_key,window)
             else:
+                window.configure_observation_planes(
+                    observation_planes,current_observation,
+                )
                 window.configure_detectors(sources,current)
                 self.synchronize_section(section_key)
 
-            self._configure_automatic_availability(window)
-            self._apply_automatic_state_to_window(section_key,window)
+            self._automatic.configure_availability(window)
+            self._automatic.apply_state_to_window(section_key,window)
             window.set_cgh_computing(
-                self.controller.is_cgh_computing(section_key)
+                self._qt_session.is_cgh_computing(section_key)
             )
             window.show()
             window.raise_()
@@ -107,490 +196,113 @@ class FeedbackCoordinator(QtCore.QObject):
             window.deleteLater()
         self._windows.clear()
 
+    def refresh_observation_planes(self) -> None:
+        for section_key in tuple(self._windows):
+            self.synchronize_feedback_state(section_key)
+
+    def _define_observation_plane(self,section_key: str) -> None:
+        window=self._windows.get(section_key)
+        name=self._qt_session._calibration.define_observation_plane(
+            section_key=section_key,parent=window,
+        )
+        if name is None:
+            self.synchronize_feedback_state(section_key)
+            return
+        self._feedback_service.select_observation_plane(section_key,name)
+
     def synchronize_section(self,section_key: str) -> None:
         window = self._windows.get(section_key)
         if window is None:
             return
-        runtime = self.controller.runtime
+        runtime = self._qt_session.runtime
+        observation_planes = tuple(
+            plane.name for plane in self._feedback_service.observation_planes()
+        )
+        current_observation = self._feedback_service.active_observation_plane(
+            section_key
+        )
+        sources = self.available_sources(section_key)
+        session_inspection=runtime.get_section_cgh_session_inspection(section_key)
+        window.configure_observation_planes(observation_planes,current_observation)
+        window.configure_detectors(
+            sources,self.preferred_source(section_key,sources),
+        )
         window.set_session_state(
             runtime.get_section_feedback_status(section_key),
             runtime.get_section_feedback_inspection(section_key),
-            runtime.get_section_cgh_session_inspection(section_key),
+            session_inspection,
             runtime.get_section_cgh_status(section_key),
             self.localization_context(section_key),
-            self.measurements_cgh_summary(section_key),
-            self.service.feedback_orientation(section_key),
-            self._feedback_orientation_ui_context(section_key),
+            self.measurements_cgh_summary(
+                section_key,inspection=session_inspection,
+            ),
         )
-        self._synchronize_position_reference(section_key,window)
-        self._synchronize_fov_position_calibration(section_key,window)
-        self._synchronize_geometry_orientation_calibration(section_key,window)
-        self._configure_automatic_availability(window)
-        self._apply_automatic_state_to_window(section_key,window)
+        self._references.synchronize(section_key,window,lightweight=True)
+        self._synchronize_geometry_warning(section_key,window)
+        self._automatic.configure_availability(window)
+        self._automatic.apply_state_to_window(section_key,window)
+
+    def synchronize_feedback_state(self,section_key: str) -> None:
+        """Refresh feedback/measurement state without rebuilding CGH round inspection."""
+        window=self._windows.get(section_key)
+        if window is None:
+            return
+        runtime=self._qt_session.runtime
+        observation_planes=tuple(
+            plane.name for plane in self._feedback_service.observation_planes()
+        )
+        current_observation=self._feedback_service.active_observation_plane(
+            section_key
+        )
+        sources=self.available_sources(section_key)
+        window.configure_observation_planes(
+            observation_planes,current_observation,
+        )
+        window.configure_detectors(
+            sources,self.preferred_source(section_key,sources),
+        )
+        window.set_feedback_state(
+            runtime.get_section_feedback_status(section_key),
+            runtime.get_section_feedback_inspection(section_key),
+            self.localization_context(section_key),
+        )
+        self._references.synchronize(section_key,window,lightweight=True)
+        self._synchronize_geometry_warning(section_key,window)
+        self._automatic.configure_availability(window)
+        self._automatic.apply_state_to_window(section_key,window)
+
+    def synchronize_position_reference(self,section_key: str) -> None:
+        """Refresh only position-reference presentation for one open window."""
+        window=self._windows.get(section_key)
+        if window is not None:
+            self._references.synchronize(section_key,window,lightweight=True)
+
+    def _synchronize_geometry_warning(
+        self,section_key: str,window: CGHSessionWindow,
+    ) -> None:
+        plane=self._feedback_service.active_observation_plane(section_key)
+        calibrated=bool(
+            plane
+            and self._feedback_service.geometry_orientation_calibration(
+                section_key,observation_plane_name=plane,
+            ) is not None
+        )
+        window.set_geometry_calibration_status(
+            observation_plane_name=plane,calibrated=calibrated,
+        )
 
     def set_cgh_computing(self,section_key: str,computing: bool) -> None:
         window = self._windows.get(section_key)
         if window is not None:
             window.set_cgh_computing(bool(computing))
-            self._apply_automatic_state_to_window(section_key,window)
+            self._automatic.apply_state_to_window(section_key,window)
 
-    def available_sources(self,section_key: str) -> Sequence[str]:
-        return self.service.available_sources(section_key)
-
-    def preferred_source(
-        self,section_key: str,available: Sequence[str],
-    ) -> str | None:
-        return self.service.preferred_source(section_key,available)
-
-    def _feedback_orientation_ui_context(
-        self,section_key: str,
-    ) -> dict[str,Any]:
-        context = self.service.feedback_orientation_context(section_key)
-        return {
-            "plane_name":context.plane_name,
-            "plane_override":context.plane_override,
-            "saved_orientation":context.saved_orientation.value,
-            "calibrated":context.calibrated,
-            "change_enabled":context.change_allowed,
-            "change_reason":context.change_unavailable_reason,
-        }
-
-    def _position_reference_ui_context(
-        self,section_key: str,
-    ) -> dict[str,Any]:
-        context = self.service.position_reference_context(section_key)
-        selection = context.selection
-        return {
-            "mode":selection.mode.value,
-            "saved_name":selection.saved_name,
-            "saved_names":context.saved_names,
-            "editable_geometry":(
-                None if selection.editable_geometry is None
-                else selection.editable_geometry.to_dict()
-            ),
-            "editable_locks":{
-                name:(name in selection.editable_locks)
-                for name in (
-                    "period_x_px","period_y_px",
-                    "rotation_deg","lattice_angle_deg",
-                )
-            },
-            "fit_geometry":(
-                None if context.fit_geometry is None
-                else context.fit_geometry.to_dict()
-            ),
-            "plane_name":context.plane_name,
-            "compatible":context.compatible,
-            "compatibility_error":context.compatibility_error,
-            "change_allowed":context.change_allowed,
-            "change_unavailable_reason":context.change_unavailable_reason,
-            "save_allowed":context.save_allowed,
-            "save_unavailable_reason":context.save_unavailable_reason,
-        }
-
-    def _synchronize_position_reference(
-        self,section_key: str,window: CGHSessionWindow,
-    ) -> None:
-        window.set_position_reference_state(
-            self._position_reference_ui_context(section_key),
-            self.service.position_reference_preview(section_key),
-        )
-
-    def _synchronize_fov_position_calibration(
-        self,section_key: str,window: CGHSessionWindow,
-    ) -> None:
-        window.set_fov_position_calibration_state(
-            self.service.fov_position_calibration_context(section_key),
-            self.service.fov_position_calibration_preview(section_key),
-        )
-
-    def _synchronize_geometry_orientation_calibration(
-        self,section_key: str,window: CGHSessionWindow,
-    ) -> None:
-        window.set_geometry_orientation_calibration_state(
-            self.service.geometry_orientation_calibration_context(section_key)
-        )
-
-    @staticmethod
-    def _log_geometry_error(
-        section_key: str,stage: str,error: Exception,
-    ) -> None:
-        _logger.error(
-            "Geometry orientation calibration %s failed for section %s: %s",
-            str(stage),str(section_key),error,
-            exc_info=(type(error),error,error.__traceback__),
-        )
-
-    def _geometry_compute_complete(
-        self,section_key: str,success: bool,error: Exception | None,
-    ) -> None:
-        window=self._windows.get(section_key)
-        self.controller.synchronize_section(section_key)
-        if success:
-            if window is not None:
-                window.measurement_view.set_measurement_status(
-                    'Geometry calibration target is displayed on the SLM. '
-                    'Adjust detector/exposure, then Acquire or Load and Localize.'
-                )
-            return
-        if error is not None:
-            self._log_geometry_error(section_key,'target computation/upload',error)
-            self._error('Geometry calibration failed',error)
-
-    def _geometry_acquisition_complete(
-        self,section_key: str,success: bool,error: Exception | None,
-    ) -> None:
-        window=self._windows.get(section_key)
-        self.controller.synchronize_section(section_key)
-        if success:
-            if window is not None:
-                window.measurement_view.set_measurement_status(
-                    'Geometry calibration image acquired. Fine-tune localization '
-                    'parameters and click Localize.'
-                )
-            return
-        if error is not None:
-            self._log_geometry_error(section_key,'acquisition',error)
-            if window is not None:
-                window.measurement_view.set_measurement_status(
-                    'Geometry calibration acquisition failed (%s). The calibration '
-                    'target remains displayed; adjust acquisition settings and retry.' % error,
-                    warning=True,
-                )
-            else:
-                self._error('Geometry calibration acquisition failed',error)
-
-    def compute_geometry_orientation_calibration(
-        self,section_key: str,values: Mapping[str,Any],
-    ) -> None:
-        try:
-            self.controller.flush_section(section_key,propagate=True)
-            px=float(values.get('period_x')); py=float(values.get('period_y'))
-            if str(values.get('period_unit') or '') == 'um':
-                px=self.service.geometry_period_from_um(section_key,px,'x')
-                py=self.service.geometry_period_from_um(section_key,py,'y')
-            self.service.compute_geometry_orientation_calibration_target(
-                section_key,grid_x=int(values.get('grid_x',5)),grid_y=int(values.get('grid_y',4)),
-                period_x_px=px,period_y_px=py,source=str(values.get('detector') or ''),
-                on_complete=lambda success,error,key=section_key:self._geometry_compute_complete(key,success,error),
-            )
-        except Exception as error:
-            self._log_geometry_error(section_key,'target computation setup',error)
-            self._error('Geometry calibration failed',error)
-            self.controller.synchronize_section(section_key)
-
-    def acquire_geometry_orientation_calibration(self,section_key: str,source: str) -> None:
-        try:
-            self.service.acquire_geometry_orientation_calibration(
-                section_key,source,
-                on_complete=lambda success,error,key=section_key:self._geometry_acquisition_complete(key,success,error),
-            )
-        except Exception as error:
-            self._log_geometry_error(section_key,'acquisition setup',error)
-            self._set_measurement_error(section_key,error)
-
-    def load_geometry_orientation_calibration(self,section_key: str) -> None:
-        try:
-            parent=self._windows.get(section_key)
-            path,_selected=QtWidgets.QFileDialog.getOpenFileName(
-                parent,'Select geometry calibration image','',
-                'Images (*.tif *.tiff *.png *.jpg *.jpeg *.bmp);;All files (*)',
-            )
-            if not path:return
-            image=np.asarray(Image.open(path).convert('F'),dtype=np.float64)
-            measurement=create_image_measurement(image,source='file',metadata={'path':str(path),'workflow':'geometry_orientation_calibration'})
-            self.service.set_geometry_orientation_calibration_measurement(section_key,measurement)
-            self.controller.synchronize_section(section_key)
-        except Exception as error:
-            self._log_geometry_error(section_key,'image load',error)
-            self._set_measurement_error(section_key,error)
-
-    def run_geometry_orientation_localization(
-        self,section_key: str,parameters: Mapping[str,Any],
-    ) -> None:
-        try:
-            self.service.geometry_orientation_localization_candidate(section_key,parameters)
-            self.controller.synchronize_section(section_key)
-        except Exception as error:
-            self._log_geometry_error(section_key,'localization',error)
-            self._set_localization_error(section_key,error)
-
-    def finish_geometry_orientation_calibration(self,section_key: str) -> None:
-        try:
-            self.service.finish_geometry_orientation_calibration(section_key)
-            self.controller.synchronize_section(section_key)
-            window=self._windows.get(section_key)
-            if window is not None:
-                window.measurement_view.set_measurement_status(
-                    'Geometry calibration finished. Current experiment CGH restored.'
-                )
-        except Exception as error:
-            self._log_geometry_error(section_key,'finish/restore',error)
-            self._error('Finishing geometry calibration failed',error)
-
-    def request_measurement(
-        self,
-        section_key: str,
-        source: str,
-        *,
-        metadata: Mapping[str,Any] | None,
-        on_result,
-        on_error,
-    ) -> None:
-        self.service.request_measurement(
-            section_key,source,metadata=metadata,
-            on_result=on_result,on_error=on_error,
-        )
-
-    def cancel_measurement(self,section_key: str) -> None:
-        self.service.cancel_measurement(section_key)
-
-    def acquire(
-        self,section_key: str,source: str,*,reuse_previous_localization: bool,
-    ) -> None:
-        if not self.controller.editor_writes_allowed:
-            return
-        try:
-            self.controller.flush_section(section_key,propagate=True)
-            self.service.acquire(
-                section_key,source,
-                reuse_previous_localization=reuse_previous_localization,
-            )
-        except Exception as error:
-            self._set_measurement_error(section_key,error)
-
-    def load(
-        self,section_key: str,*,reuse_previous_localization: bool,
-    ) -> None:
-        if not self.controller.editor_writes_allowed:
-            return
-        try:
-            self.controller.flush_section(section_key,propagate=True)
-            parent = self._windows.get(section_key)
-            path,_selected = QtWidgets.QFileDialog.getOpenFileName(
-                parent,"Select feedback image","",
-                "Images (*.tif *.tiff *.png *.jpg *.jpeg *.bmp);;All files (*)",
-            )
-            if not path:
-                return
-            image = np.asarray(Image.open(path).convert("F"),dtype=np.float64)
-            measurement = create_image_measurement(
-                image,source="file",metadata={"path":str(path)},
-            )
-            self.service.commit_measurement(
-                section_key,measurement,
-                reuse_previous_localization=reuse_previous_localization,
-            )
-        except Exception as error:
-            self._set_measurement_error(section_key,error)
-
-    def commit_measurement(
-        self,
-        section_key: str,
-        measurement: ImageMeasurement,
-        *,
-        reuse_previous_localization: bool=False,
-    ) -> bool:
-        return self.service.commit_measurement(
-            section_key,measurement,
-            reuse_previous_localization=reuse_previous_localization,
-        )
-
-    def localization_candidate(
-        self,section_key: str,parameters: Mapping[str,Any],
-    ):
-        return self.service.localization_candidate(section_key,parameters)
-
-    def run_localization_candidate(
-        self,section_key: str,parameters: Mapping[str,Any],
-    ) -> None:
-        try:
-            candidate,metrics = self.service.localization_candidate(
-                section_key,parameters,
-            )
-            window = self._windows.get(section_key)
-            if window is not None:
-                window.set_localization_result(
-                    candidate,parameters,metrics=metrics,
-                )
-        except Exception as error:
-            self._set_localization_error(section_key,error)
-
-    def infer_missing_localization_candidate(
-        self,section_key: str,localization: Any,parameters: Mapping[str,Any],
-    ) -> None:
-        try:
-            candidate,metrics = self.service.infer_missing_localization_candidate(
-                section_key,localization,
-            )
-            window = self._windows.get(section_key)
-            if window is not None:
-                window.set_localization_result(
-                    candidate,parameters,metrics=metrics,
-                )
-        except Exception as error:
-            self._set_localization_error(section_key,error)
-
-    def accept_localization(
-        self,
-        section_key: str,
-        localization: Any,
-        parameters: Mapping[str,Any],
-        *,
-        raise_errors: bool=False,
-    ) -> None:
-        self.service.accept_localization(
-            section_key,localization,parameters,raise_errors=raise_errors,
-        )
-
-    def reuse_localization(
-        self,section_key: str,*,raise_errors: bool=False,
-    ):
-        return self.service.reuse_localization(
-            section_key,raise_errors=raise_errors,
-        )
-
-    def localize_and_commit(self,section_key: str) -> None:
-        self.service.localize_and_commit(section_key)
-
-    def update_parameters(
-        self,
-        section_key: str,
-        group: str,
-        changes: Mapping[str,Any],
-        *,
-        localization: Any=None,
-        localization_parameters: Mapping[str,Any] | None=None,
-    ) -> None:
-        try:
-            result = self.service.update_parameters(
-                section_key,group,changes,localization=localization,
-            )
-            window = self._windows.get(section_key)
-            if (
-                window is not None
-                and localization is not None
-                and result.candidate_analysis is not None
-            ):
-                window.set_localization_result(
-                    localization,dict(localization_parameters or {}),
-                    metrics=result.candidate_analysis,
-                )
-        except Exception as error:
-            self._error("Feedback parameter update failed",error)
-            self.controller.synchronize_section(section_key)
-
-    def apply_intensity_feedback(
-        self,section_key: str,*,raise_errors: bool=False,
-    ):
-        return self._run_resolution(
-            section_key,
-            lambda:self.service.apply_intensity_feedback(
-                section_key,raise_errors=raise_errors,
-            ),
-            raise_errors=raise_errors,
-        )
-
-    def reset_intensity_feedback(self,section_key: str) -> None:
-        self._run_resolution(
-            section_key,lambda:self.service.reset_intensity_feedback(section_key),
-        )
-
-    def apply_position_correction(self,section_key: str) -> None:
-        if not self.controller.editor_writes_allowed:
-            return
-        reset = self._confirm_position_intensity_reset(section_key)
-        if reset is None:
-            return
-        self._run_resolution(
-            section_key,
-            lambda:self.service.apply_position_correction(
-                section_key,reset_intensity=reset,
-            ),
-        )
-
-    def set_position_active(self,section_key: str,active: bool) -> None:
-        if not self.controller.editor_writes_allowed:
-            return
-        reset = self._confirm_position_intensity_reset(section_key)
-        if reset is None:
-            return
-        self._run_resolution(
-            section_key,
-            lambda:self.service.set_position_active(
-                section_key,bool(active),reset_intensity=reset,
-            ),
-        )
-
-    def clear_position_correction(self,section_key: str) -> None:
-        if not self.controller.editor_writes_allowed:
-            return
-        reset = self._confirm_position_intensity_reset(section_key)
-        if reset is None:
-            return
-        self._run_resolution(
-            section_key,
-            lambda:self.service.clear_position_correction(
-                section_key,reset_intensity=reset,
-            ),
-        )
-
-    def reset_to_round(self,section_key: str,round_index: int) -> None:
-        if not self.controller.editor_writes_allowed:
-            return
-        runtime = self.controller.runtime
-        inspection = runtime.get_section_cgh_session_inspection(section_key)
-        rounds = {item.index:item for item in inspection.rounds}
-        if int(round_index) not in rounds:
-            self._warning("Reset CGH round","Only computed rounds can be restored.")
-            return
-        later = [
-            item.index for item in inspection.rounds
-            if item.index > int(round_index)
-        ]
-        if not later and inspection.working_round is None:
-            return
-        if not self._confirm_round_reset(
-            section_key,int(round_index),len(later),
-            inspection.working_round is not None,
-        ):
-            return
-        try:
-            self.service.reset_to_round(section_key,int(round_index))
-        except Exception as error:
-            self._error("Reset CGH round failed",error)
-
-    def propagate_round(
-        self,
-        section_key: str,
-        round_index: int,
-        *,
-        position_context: str="corrected",
-        pad_size: Any=1024,
-    ) -> None:
-        window = self._windows.get(section_key)
-        try:
-            intensity = self.service.propagate_round(
-                section_key,int(round_index),
-                position_context=position_context,pad_size=pad_size,
-            )
-            if window is not None:
-                window.set_propagation_result(int(round_index),intensity)
-        except Exception as error:
-            if window is not None:
-                window.set_propagation_error(error)
-            else:
-                self._error("CGH propagation failed",error)
-
-    def feedback_measurement_metadata(self,section_key: str) -> dict[str,Any]:
-        return self.service.feedback_measurement_metadata(section_key)
-
-    def localization_context(self,section_key: str) -> Mapping[str,Any]:
-        return self.service.localization_context(section_key)
-
-    def measurements_cgh_summary(self,section_key: str) -> Mapping[str,Any]:
-        runtime = self.controller.runtime
-        inspection = runtime.get_section_cgh_session_inspection(section_key)
+    def measurements_cgh_summary(
+        self,section_key: str,*,inspection: Any | None=None,
+    ) -> Mapping[str,Any]:
+        runtime = self._qt_session.runtime
+        if inspection is None:
+            inspection = runtime.get_section_cgh_session_inspection(section_key)
         target_state = None
         working = inspection.working_round
         if working is not None and working.target_state is not None:
@@ -608,7 +320,7 @@ class FeedbackCoordinator(QtCore.QObject):
             target_key = target_state.target_type
             target_params = target_state.canonical_params
 
-        summary = dict(self.controller._target_presentation_summary(
+        summary = dict(self._qt_session._target_presentation_summary(
             section_key,target_key,target_params,
         ))
         if state.selected_target in state.items:
@@ -619,476 +331,271 @@ class FeedbackCoordinator(QtCore.QObject):
             })
         return summary
 
-    def require_current_cgh_for_localization_commit(self,section_key: str) -> None:
-        self.service.require_current_cgh_for_localization_commit(section_key)
-
-    def validate_target_hint_use(
-        self,section_key: str,parameters: Mapping[str,Any],
-    ) -> None:
-        self.service.validate_target_hint_use(section_key,parameters)
-
-    def _run_resolution(
-        self,section_key: str,operation,*,raise_errors: bool=False,
-    ):
-        if not self.controller.editor_writes_allowed:
-            if raise_errors:
-                raise RuntimeError(
-                    "Feedback changes are unavailable in Fast Config mode"
-                )
-            return False,None
-        try:
-            self.controller.flush_section(section_key,propagate=True)
-            return operation()
-        except Exception as error:
-            if raise_errors:
-                raise
-            self._error("Feedback operation failed",error)
-            self.controller.synchronize_section(section_key)
-            return False,None
-
-    def _confirm_position_intensity_reset(self,section_key: str):
-        count = int(
-            self.controller.runtime.get_section_feedback_status(
-                section_key
-            ).intensity_count
-        )
-        if count <= 0:
-            return False
-        parent = self._windows.get(section_key)
-        dialog = QtWidgets.QMessageBox(parent)
-        dialog.setIcon(QtWidgets.QMessageBox.Warning)
-        dialog.setWindowTitle("Position correction")
-        dialog.setText(
-            "Changing spot positions resets the current CGH intensity "
-            "sequence (%d feedback round(s))." % count
-        )
-        dialog.setInformativeText(
-            "The previously applied hologram will remain displayed and be "
-            "marked stale until a new Round 0 CGH is computed."
-        )
-        reset_button = dialog.addButton(
-            "Reset intensity and apply",QtWidgets.QMessageBox.AcceptRole,
-        )
-        dialog.addButton(QtWidgets.QMessageBox.Cancel)
-        dialog.setDefaultButton(reset_button)
-        dialog.exec_() if hasattr(dialog,"exec_") else dialog.exec()
-        return True if dialog.clickedButton() is reset_button else None
-
-    def _confirm_round_reset(
-        self,
-        section_key: str,
-        round_index: int,
-        later_round_count: int,
-        has_working_round: bool,
-    ) -> bool:
-        consequences = []
-        if later_round_count:
-            consequences.append("%d later computed round(s)" % later_round_count)
-        if has_working_round:
-            consequences.append("the current uncomputed working round")
-        detail = " and ".join(consequences) or "later session state"
-        parent = self._windows.get(section_key)
-        result = QtWidgets.QMessageBox.question(
-            parent,
-            "Reset CGH round",
-            "Reset the session to Round %d? This will permanently discard %s."
-            % (round_index,detail),
-            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-            QtWidgets.QMessageBox.No,
-        )
-        return result == QtWidgets.QMessageBox.Yes
+    def _show_inspection(self,section_key: str) -> None:
+        window = self._windows.get(section_key)
+        if window is not None:
+            window.show_inspection(
+                self._qt_session.runtime.get_section_feedback_inspection(section_key)
+            )
 
     def _on_action(
         self,section_key: str,action: str,options: Mapping[str,Any],
     ) -> None:
-        if not self.controller.editor_writes_allowed:
-            return
-        try:
-            request = MeasurementsAction(str(action))
-        except Exception:
-            self._error(
-                "Unknown measurements action",
-                RuntimeError("Unsupported measurements action: %r" % action),
-            )
-            return
-        values = dict(options or {})
-        if request is MeasurementsAction.AUTOMATIC_STOP:
-            self.service.stop_automatic_feedback()
-            return
-        if self.service.automatic_operation_active:
-            return
+        self._actions.dispatch(section_key,action,options)
 
-        if request is MeasurementsAction.ACQUIRE:
-            if values.get("geometry_calibration"):
-                self.acquire_geometry_orientation_calibration(
-                    section_key,str(values.get("detector") or ""),
-                )
-            else:
-                self.acquire(
-                    section_key,str(values.get("detector") or ""),
-                    reuse_previous_localization=bool(
-                        values.get("reuse_previous_localization",False)
-                    ),
-                )
-        elif request is MeasurementsAction.LOAD:
-            if values.get("geometry_calibration"):
-                self.load_geometry_orientation_calibration(section_key)
-            else:
-                self.load(
-                    section_key,
-                    reuse_previous_localization=bool(
-                        values.get("reuse_previous_localization",False)
-                    ),
-                )
-        elif request is MeasurementsAction.LOCALIZATION_RUN:
-            if values.get("geometry_calibration"):
-                self.run_geometry_orientation_localization(
-                    section_key,values.get("parameters",{}),
-                )
-            else:
-                self.run_localization_candidate(
-                    section_key,values.get("parameters",{}),
-                )
-        elif request is MeasurementsAction.LOCALIZATION_INFER_MISSING:
-            self.infer_missing_localization_candidate(
-                section_key,values.get("localization"),
-                values.get("parameters",{}),
-            )
-        elif request is MeasurementsAction.LOCALIZATION_ACCEPT:
-            self.accept_localization(
-                section_key,values.get("localization"),
-                values.get("parameters",{}),
-            )
-        elif request is MeasurementsAction.LOCALIZATION_REUSE:
-            self.reuse_localization(section_key)
-        elif request is MeasurementsAction.FEEDBACK_PARAMETERS:
-            self.update_parameters(
-                section_key,str(values.get("group") or ""),
-                values.get("changes",{}),
-                localization=values.get("localization"),
-                localization_parameters=values.get(
-                    "localization_parameters",{}
-                ),
-            )
-        elif request is MeasurementsAction.GEOMETRY_CALIBRATION_COMPUTE:
-            self.compute_geometry_orientation_calibration(section_key,values)
-        elif request is MeasurementsAction.GEOMETRY_CALIBRATION_ANALYZE:
-            try:
-                analysis=self.service.analyze_geometry_orientation_calibration(section_key)
-                self.controller.synchronize_section(section_key)
-                if not analysis.accepted:
-                    window=self._windows.get(section_key)
-                    if window is not None:
-                        window.measurement_view.set_measurement_status(
-                            'Geometry orientation is ambiguous; adjust/reacquire before saving.',warning=True,
-                        )
-            except Exception as error:
-                self._log_geometry_error(section_key,'analysis',error)
-                self._error('Geometry calibration analysis failed',error)
-        elif request is MeasurementsAction.GEOMETRY_CALIBRATION_SAVE:
-            try:
-                self.service.save_geometry_orientation_calibration(section_key)
-                self.controller.synchronize_section(section_key)
-            except Exception as error:
-                self._log_geometry_error(section_key,'save',error)
-                self._error('Saving geometry calibration failed',error)
-        elif request is MeasurementsAction.GEOMETRY_CALIBRATION_FINISH:
-            self.finish_geometry_orientation_calibration(section_key)
-        elif request is MeasurementsAction.FEEDBACK_ORIENTATION:
-            self.service.set_feedback_orientation(
-                section_key,values.get("orientation","identity"),
-            )
-        elif request is MeasurementsAction.FEEDBACK_ORIENTATION_SAVE:
-            self.service.save_feedback_orientation(section_key)
-        elif request is MeasurementsAction.INTENSITY_APPLY:
-            self.apply_intensity_feedback(section_key)
-        elif request is MeasurementsAction.INTENSITY_RESET:
-            self.reset_intensity_feedback(section_key)
-        elif request is MeasurementsAction.POSITION_APPLY:
-            self.apply_position_correction(section_key)
-        elif request is MeasurementsAction.POSITION_REFERENCE_SET:
-            self.set_position_reference(
-                section_key,
-                mode=str(values.get("mode") or "global_fit"),
-                saved_name=values.get("saved_name"),
-                editable_geometry=values.get("editable_geometry"),
-                editable_locks=values.get("editable_locks"),
-            )
-        elif request is MeasurementsAction.POSITION_REFERENCE_FIT_CENTER:
-            self.fit_position_reference_center(section_key)
-        elif request is MeasurementsAction.POSITION_REFERENCE_SAVE:
-            self.save_position_reference(
-                section_key,str(values.get("name") or "").strip(),
-            )
-        elif request is MeasurementsAction.POSITION_REFERENCE_DELETE:
-            self.delete_position_reference(
-                section_key,str(values.get("name") or "").strip(),
-            )
-        elif request is MeasurementsAction.FOV_CALIBRATION_FIT:
-            self.fit_fov_position_calibration(
-                section_key,
-                model=str(values.get("model") or "polynomial"),
-                degree=int(values.get("degree") or 2),
-            )
-        elif request is MeasurementsAction.FOV_CALIBRATION_SAVE:
-            self.save_fov_position_calibration(
-                section_key,str(values.get("name") or "").strip(),
-            )
-        elif request is MeasurementsAction.FOV_CALIBRATION_REPLACE:
-            self.replace_applied_fov_position_calibration(section_key)
-        elif request is MeasurementsAction.POSITION_SET_ACTIVE:
-            self.set_position_active(
-                section_key,bool(values.get("active",False)),
-            )
-        elif request is MeasurementsAction.POSITION_CLEAR:
-            self.clear_position_correction(section_key)
-        elif request is MeasurementsAction.COMPUTE_ADAPTED:
-            self.controller.compute_adapted_cgh(section_key)
-        elif request is MeasurementsAction.RESET_TO_ROUND:
-            self.reset_to_round(section_key,int(values.get("round_index")))
-        elif request is MeasurementsAction.PROPAGATE_SELECTED:
-            self.propagate_round(
-                section_key,
-                int(values.get("round_index")),
-                position_context=str(
-                    values.get("position_context") or "corrected"
-                ),
-                pad_size=values.get("pad_size",1024),
-            )
-        elif request is MeasurementsAction.INSPECT:
-            window = self._windows.get(section_key)
-            if window is not None:
-                window.show_inspection(
-                    self.controller.runtime.get_section_feedback_inspection(
-                        section_key
-                    )
-                )
-        elif request is MeasurementsAction.AUTOMATIC_START:
-            try:
-                self.controller.flush_section(section_key,propagate=True)
-                self.service.start_automatic_feedback(
-                    section_key,
-                    rounds=int(values.get("rounds",1)),
-                    source=str(values.get("detector") or ""),
-                    reuse_previous_localization=bool(
-                        values.get("reuse_previous_localization",False)
-                    ),
-                )
-            except Exception as error:
-                self._error("Automatic feedback failed",error)
+    # ------------------------------------------------------------------
+    # Delegated measurement/localization API
+    # ------------------------------------------------------------------
+
+    def available_sources(self,section_key: str) -> Sequence[str]:
+        return self._measurement.available_sources(section_key)
+
+    def preferred_source(
+        self,section_key: str,available: Sequence[str],
+    ) -> str | None:
+        return self._measurement.preferred_source(section_key,available)
+
+    def request_measurement(
+        self,
+        section_key: str,
+        source: str,
+        *,
+        metadata: Mapping[str,Any] | None,
+        on_result,
+        on_error,
+    ) -> None:
+        self._measurement.request_measurement(
+            section_key,source,metadata=metadata,
+            on_result=on_result,on_error=on_error,
+        )
+
+    def cancel_measurement(self,section_key: str) -> None:
+        self._measurement.cancel_measurement(section_key)
+
+    def acquire(
+        self,section_key: str,source: str,*,reuse_previous_localization: bool,
+    ) -> None:
+        self._measurement.acquire(
+            section_key,source,
+            reuse_previous_localization=reuse_previous_localization,
+        )
+
+    def load(
+        self,section_key: str,*,reuse_previous_localization: bool,
+    ) -> None:
+        self._measurement.load(
+            section_key,
+            reuse_previous_localization=reuse_previous_localization,
+        )
+
+    def commit_measurement(
+        self,
+        section_key: str,
+        measurement: ImageMeasurement,
+        *,
+        reuse_previous_localization: bool=False,
+    ) -> bool:
+        return self._measurement.commit_measurement(
+            section_key,measurement,
+            reuse_previous_localization=reuse_previous_localization,
+        )
+
+    def feedback_measurement_metadata(self,section_key: str) -> dict[str,Any]:
+        return self._measurement.feedback_measurement_metadata(section_key)
+
+    def localization_candidate(
+        self,section_key: str,parameters: Mapping[str,Any],
+    ) -> tuple[LocalizationResult,IntensityAnalysis | None]:
+        return self._localization.localization_candidate(section_key,parameters)
+
+    def run_localization_candidate(
+        self,section_key: str,parameters: Mapping[str,Any],
+    ) -> None:
+        self._localization.run_localization_candidate(section_key,parameters)
+
+    def infer_missing_localization_candidate(
+        self,section_key: str,localization: LocalizationResult,parameters: Mapping[str,Any],
+    ) -> None:
+        self._localization.infer_missing_localization_candidate(
+            section_key,localization,parameters,
+        )
+
+    def accept_localization(
+        self,
+        section_key: str,
+        localization: LocalizationResult,
+        parameters: Mapping[str,Any],
+        *,
+        raise_errors: bool=False,
+    ) -> None:
+        self._localization.accept_localization(
+            section_key,localization,parameters,raise_errors=raise_errors,
+        )
+
+    def reuse_localization(
+        self,section_key: str,*,raise_errors: bool=False,
+    ) -> LocalizationResult | None:
+        return self._localization.reuse_localization(
+            section_key,raise_errors=raise_errors,
+        )
+
+    def localize_and_commit(self,section_key: str) -> None:
+        self._localization.localize_and_commit(section_key)
+
+    def update_parameters(
+        self,
+        section_key: str,
+        group: str,
+        changes: Mapping[str,Any],
+        *,
+        localization: LocalizationResult | None=None,
+        localization_parameters: Mapping[str,Any] | None=None,
+    ) -> None:
+        self._localization.update_parameters(
+            section_key,group,changes,
+            localization=localization,
+            localization_parameters=localization_parameters,
+        )
+
+    def localization_context(self,section_key: str) -> Mapping[str,Any]:
+        return self._localization.localization_context(section_key)
+
+    def require_current_cgh_for_localization_commit(self,section_key: str) -> None:
+        self._localization.require_current_cgh_for_localization_commit(section_key)
+
+    def validate_target_hint_use(
+        self,section_key: str,parameters: Mapping[str,Any],
+    ) -> None:
+        self._localization.validate_target_hint_use(section_key,parameters)
+
+    # ------------------------------------------------------------------
+    # Delegated geometry/reference workflows
+    # ------------------------------------------------------------------
 
     def set_position_reference(
         self,
         section_key: str,
         *,
         mode: str,
-        saved_name: str | None,
+        reference_name: str | None,
         editable_geometry: Mapping[str,Any] | None=None,
         editable_locks: Mapping[str,Any] | None=None,
+        correspondence: str | None=None,
+        correction_mode: str | None=None,
+        polynomial_degree: int | None=None,
+        affine_transform: Any=_UNSET,
+        manual_transform: Any=_UNSET,
     ) -> None:
-        try:
-            self.controller.flush_section(section_key,propagate=True)
-            self.service.set_position_reference(
-                section_key,
-                mode=mode,
-                saved_name=saved_name,
-                editable_geometry=editable_geometry,
-                editable_locks=editable_locks,
-            )
-        except Exception as error:
-            self._error("Changing position reference failed",error)
-            self.controller.synchronize_section(section_key)
+        kwargs = {
+            "mode":mode,
+            "reference_name":reference_name,
+            "editable_geometry":editable_geometry,
+            "editable_locks":editable_locks,
+            "correspondence":correspondence,
+            "correction_mode":correction_mode,
+            "polynomial_degree":polynomial_degree,
+        }
+        if affine_transform is not _UNSET:
+            kwargs["affine_transform"] = affine_transform
+        if manual_transform is not _UNSET:
+            kwargs["manual_transform"] = manual_transform
+        self._references.set_position_reference(section_key,**kwargs)
 
     def fit_position_reference_center(self,section_key: str) -> None:
-        try:
-            self.controller.flush_section(section_key,propagate=True)
-            self.service.fit_position_reference_center(section_key)
-        except Exception as error:
-            self._error("Fitting center reference failed",error)
-            self.controller.synchronize_section(section_key)
+        self._references.fit_position_reference_center(section_key)
 
-    def save_position_reference(self,section_key: str,name: str) -> None:
-        if not name:
-            return
-        try:
-            self.service.save_position_reference(section_key,name)
-        except FileExistsError:
-            parent = self._windows.get(section_key)
-            answer = QtWidgets.QMessageBox.question(
-                parent,
-                "Replace position reference",
-                'Position reference "%s" already exists for this plane. Replace it?'
-                % name,
-                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-                QtWidgets.QMessageBox.No,
-            )
-            if answer != QtWidgets.QMessageBox.Yes:
-                return
-            try:
-                self.service.save_position_reference(
-                    section_key,name,overwrite=True,
-                )
-            except Exception as error:
-                self._error("Saving position reference failed",error)
-        except Exception as error:
-            self._error("Saving position reference failed",error)
+    def add_position_reference(self,section_key: str,name: str) -> None:
+        self._references.add_position_reference(section_key,name)
+
+    def persist_position_reference(self,section_key: str,name: str) -> None:
+        self._references.persist_position_reference(section_key,name)
 
     def delete_position_reference(self,section_key: str,name: str) -> None:
-        if not name:
-            return
-        parent = self._windows.get(section_key)
-        answer = QtWidgets.QMessageBox.question(
-            parent,
-            "Delete position reference",
-            'Delete saved position reference "%s"?' % name,
-            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-            QtWidgets.QMessageBox.No,
-        )
-        if answer != QtWidgets.QMessageBox.Yes:
-            return
-        try:
-            self.service.delete_position_reference(section_key,name)
-        except Exception as error:
-            self._error("Deleting position reference failed",error)
+        self._references.delete_position_reference(section_key,name)
 
-    def fit_fov_position_calibration(
-        self,section_key: str,*,model: str="polynomial",degree: int=2,
+    # ------------------------------------------------------------------
+    # Delegated feedback adaptation API
+    # ------------------------------------------------------------------
+
+    def apply_intensity_feedback(
+        self,section_key: str,*,raise_errors: bool=False,
+    ) -> tuple[bool,SectionStateTransition | None]:
+        return self._adaptation.apply_intensity_feedback(
+            section_key,raise_errors=raise_errors,
+        )
+
+    def reset_intensity_feedback(self,section_key: str) -> None:
+        self._adaptation.reset_intensity_feedback(section_key)
+
+    def apply_position_correction(self,section_key: str) -> None:
+        self._adaptation.apply_position_correction(section_key)
+
+    def set_position_active(self,section_key: str,active: bool) -> None:
+        self._adaptation.set_position_active(section_key,active)
+
+    def set_position_active_from_dashboard(
+        self,section_key: str,active: bool,
     ) -> None:
-        try:
-            self.controller.flush_section(section_key,propagate=True)
-            self.service.fit_fov_position_calibration(
-                section_key,model=model,degree=degree,
-            )
-            self.controller.synchronize_section(section_key)
-        except Exception as error:
-            self._error("Fitting FOV calibration failed",error)
-            self.controller.synchronize_section(section_key)
-
-    def save_fov_position_calibration(self,section_key: str,name: str) -> None:
-        if not name:
-            return
-        try:
-            self.service.save_fov_position_calibration(section_key,name)
-        except FileExistsError:
-            parent = self._windows.get(section_key)
-            answer = QtWidgets.QMessageBox.question(
-                parent,"Replace FOV calibration",
-                'FOV calibration "%s" already exists for this SLM/section/plane. Replace it?'
-                % name,
-                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-                QtWidgets.QMessageBox.No,
-            )
-            if answer != QtWidgets.QMessageBox.Yes:
-                return
-            try:
-                self.service.save_fov_position_calibration(
-                    section_key,name,overwrite=True,
-                )
-            except Exception as error:
-                self._error("Saving FOV calibration failed",error)
-        except Exception as error:
-            self._error("Saving FOV calibration failed",error)
-        self.controller.synchronize_section(section_key)
-
-    def replace_applied_fov_position_calibration(self,section_key: str) -> None:
-        parent = self._windows.get(section_key)
-        context = self.service.fov_position_calibration_context(section_key)
-        name = context.get("selected_name")
-        if not name:
-            return
-        warning = self.service.fov_position_calibration_replacement_warning(
-            section_key
+        """Route the compact CGH checkbox through normal feedback actions."""
+        self._actions.dispatch(
+            section_key,MeasurementsAction.POSITION_SET_ACTIVE.value,
+            {"active":bool(active)},
         )
-        text = 'Replace applied FOV calibration "%s" with the current fit?' % name
-        if warning:
-            text += "\n\n" + warning
-        answer = QtWidgets.QMessageBox.question(
-            parent,"Replace applied FOV calibration",text,
-            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-            QtWidgets.QMessageBox.No,
-        )
-        if answer != QtWidgets.QMessageBox.Yes:
-            return
-        try:
-            self.service.replace_applied_fov_position_calibration(section_key)
-        except Exception as error:
-            self._error("Replacing FOV calibration failed",error)
-        self.controller.synchronize_section(section_key)
 
-    def _configure_automatic_availability(self,window: CGHSessionWindow) -> None:
-        window.set_automatic_feedback_available(
-            self.service.can_run_automatic_feedback,
-            self.service.automatic_feedback_unavailable_reason,
+    def clear_position_correction(self,section_key: str) -> None:
+        self._adaptation.clear_position_correction(section_key)
+
+    def reset_to_round(self,section_key: str,round_index: int) -> None:
+        self._adaptation.reset_to_round(section_key,round_index)
+
+    def propagate_round(
+        self,
+        section_key: str,
+        round_index: int,
+        *,
+        position_context: str="corrected",
+        pad_size: Any=1024,
+    ) -> None:
+        self._adaptation.propagate_round(
+            section_key,round_index,
+            position_context=position_context,pad_size=pad_size,
         )
+
+    # ------------------------------------------------------------------
+    # Application callbacks and lifecycle
+    # ------------------------------------------------------------------
 
     def on_automatic_state_changed(self,state: AutomaticFeedbackState) -> None:
-        self.controller._set_section_interaction_locked(bool(state.active))
-        for section_key,window in tuple(self._windows.items()):
-            self._apply_automatic_state_to_window(section_key,window,state=state)
-        self.controller.sigAutomaticOperationChanged.emit(bool(state.active))
+        self._automatic.on_state_changed(state)
 
     def on_automatic_finished(self,section_key: str,message: str) -> None:
-        window = self._windows.get(section_key)
-        if window is not None:
-            window.measurement_view.set_measurement_status(str(message))
+        self._automatic.on_finished(section_key,message)
 
     def on_measurement_busy_changed(
         self,section_key: str,busy: bool,message: str,
     ) -> None:
-        window = self._windows.get(section_key)
-        if window is None:
-            return
-        window.set_measurement_busy(bool(busy),str(message or ""))
-        self._apply_automatic_state_to_window(section_key,window)
+        self._measurement.on_busy_changed(section_key,busy,message)
 
     def on_measurement_error(self,section_key: str,error: Exception) -> None:
-        self._set_measurement_error(section_key,error)
+        self._measurement.on_error(section_key,error)
 
     def on_localization_error(self,section_key: str,error: Exception) -> None:
-        self._set_localization_error(section_key,error)
-
-    def _apply_automatic_state_to_window(
-        self,
-        section_key: str,
-        window: CGHSessionWindow,
-        *,
-        state: AutomaticFeedbackState | None=None,
-    ) -> None:
-        state = self.service.automatic_state if state is None else state
-        if not state.active:
-            window.set_automatic_operation_state(False)
-            return
-        window.set_automatic_operation_state(
-            True,
-            owner=section_key == state.section_key,
-            stopping=state.stop_requested,
-            progress=state.progress,
-        )
+        self._localization.on_error(section_key,error)
 
     def _set_measurement_error(self,section_key: str,error: Exception) -> None:
-        window = self._windows.get(section_key)
-        if window is not None:
-            window.set_measurement_error(error)
-        else:
-            self._error("Measurement failed",error)
+        self._measurement.set_error(section_key,error)
 
     def _set_localization_error(self,section_key: str,error: Exception) -> None:
-        window = self._windows.get(section_key)
-        if window is not None:
-            window.set_localization_error(error)
-        else:
-            self._error("Localization failed",error)
+        self._localization.set_error(section_key,error)
 
     def _warning(self,title: str,message: Any) -> None:
-        self.controller.sigWarning.emit(str(title),message)
+        self._qt_session.sigWarning.emit(str(title),message)
 
     def _error(self,title: str,error: Exception) -> None:
-        self.controller._emit_exception(str(title),error)
+        self._qt_session._emit_exception(str(title),error)
 
     def refresh_automatic_availability(self) -> None:
-        for section_key,window in tuple(self._windows.items()):
-            self._configure_automatic_availability(window)
-            self._apply_automatic_state_to_window(section_key,window)
+        self._automatic.refresh_availability()
 
     def prepare_runtime_replacement(self) -> None:
         self.close_windows()

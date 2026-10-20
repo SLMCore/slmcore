@@ -12,6 +12,7 @@ from ..measurement.localization_view import MeasurementLocalizationView
 
 LINEAR_PHASE_METHOD = "linear_phase"
 TARGET_LOCALIZATION_METHOD = "target_localization"
+_DEFINE_OBSERVATION_PLANE = "__define_observation_plane__"
 
 
 def _default_values(specs: Mapping[str,Any]) -> dict[str, Any]:
@@ -31,6 +32,8 @@ class CalibrationDialog(QtWidgets.QDialog):
 
     sigAcquireRequested = QtCore.Signal(str)
     sigLoadRequested = QtCore.Signal()
+    sigObservationPlaneChanged = QtCore.Signal(object)
+    sigDefineObservationPlaneRequested = QtCore.Signal()
     sigLocalizationRunRequested = QtCore.Signal(object)
     sigCalibrationRequested = QtCore.Signal(str,object)
     sigMethodChanged = QtCore.Signal(str)
@@ -45,28 +48,39 @@ class CalibrationDialog(QtWidgets.QDialog):
     def __init__(
         self,
         *,
-        plane_name: str | None=None,
+        mapping_name: str | None=None,
+        section_key: str | None=None,
+        section_title: str | None=None,
+        observation_planes: Sequence[str]=(),
+        current_observation_plane: str | None=None,
+        observation_default_pixel_size_um: float | None=None,
         localization_parameters: Mapping[str, Any] | None=None,
         target_context: Mapping[str, Any] | None=None,
         detectors: Sequence[str]=(),
         current_detector: str | None=None,
         title: str="Calibration",
         parent: QtWidgets.QWidget | None=None,
+        embedded: bool=False,
     ) -> None:
         super().__init__(parent)
+        self._embedded=bool(embedded)
         self.setWindowTitle(str(title))
-        self.setWindowFlags(
-            self.windowFlags()
-            | QtCore.Qt.WindowMinimizeButtonHint
-            | QtCore.Qt.WindowMaximizeButtonHint
-        )
-        self.setMinimumSize(900,640)
-        self.resize(1180,760)
-        self.setAttribute(QtCore.Qt.WA_DeleteOnClose,True)
+        if self._embedded:
+            self.setWindowFlags(QtCore.Qt.Widget)
+        else:
+            self.setWindowFlags(
+                self.windowFlags()
+                | QtCore.Qt.WindowMinimizeButtonHint
+                | QtCore.Qt.WindowMaximizeButtonHint
+            )
+            self.setMinimumSize(900,640)
+            self.resize(1180,760)
+            self.setAttribute(QtCore.Qt.WA_DeleteOnClose,True)
 
-        self._plane_name = ""
+        self._mapping_name = ""
+        self._section_key = str(section_key or "").strip()
+        self._section_title = str(section_title or self._section_key).strip()
         self._target_available = False
-        self._bound_detector = ""
         self._target_calibration_candidate = None
         self._linear_edits: dict[str, QtWidgets.QLineEdit] = {}
 
@@ -74,12 +88,12 @@ class CalibrationDialog(QtWidgets.QDialog):
         layout.setContentsMargins(8,8,8,8)
         layout.setSpacing(8)
 
-        self._plane_label = QtWidgets.QLabel()
-        plane_font = self._plane_label.font()
-        plane_font.setBold(True)
-        self._plane_label.setFont(plane_font)
-        layout.addWidget(self._plane_label)
-        self.set_plane_name(plane_name)
+        self._mapping_label = QtWidgets.QLabel()
+        mapping_font = self._mapping_label.font()
+        mapping_font.setBold(True)
+        self._mapping_label.setFont(mapping_font)
+        layout.addWidget(self._mapping_label)
+        self.set_mapping_name(mapping_name)
 
         method_row = QtWidgets.QHBoxLayout()
         method_row.addWidget(QtWidgets.QLabel("Method:"))
@@ -100,11 +114,11 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._target_page = self._build_target_localization_page(
             localization_parameters or _default_values(LOCALIZATION_PARAMS),
             target_context,
+            observation_planes,
+            current_observation_plane,
+            observation_default_pixel_size_um,
             detectors,
             current_detector,
-        )
-        self.target_view.sigDetectorChanged.connect(
-            self._refresh_detector_binding_warning,
         )
         self._stack.addWidget(self._linear_page)
         self._stack.addWidget(self._target_page)
@@ -116,7 +130,8 @@ class CalibrationDialog(QtWidgets.QDialog):
             self._calibration_button,
             QtWidgets.QDialogButtonBox.AcceptRole,
         )
-        self._button_box.addButton(QtWidgets.QDialogButtonBox.Cancel)
+        if not self._embedded:
+            self._button_box.addButton(QtWidgets.QDialogButtonBox.Cancel)
         self._calibration_button.clicked.connect(
             self._request_calibration,
         )
@@ -147,48 +162,78 @@ class CalibrationDialog(QtWidgets.QDialog):
         return self._target_calibration_candidate
 
     @property
-    def plane_name(self) -> str:
-        return self._plane_name
+    def mapping_name(self) -> str:
+        return self._mapping_name
 
-    def set_plane_name(self,plane_name: str | None) -> None:
-        plane = str(plane_name or "").strip()
-        self._plane_name = plane
-        self._plane_label.setText(
-            "Calibrating plane: %s" % plane
-            if plane else "Calibrating plane: none"
+    def set_mapping_name(self,mapping_name: str | None) -> None:
+        mapping = str(mapping_name or "").strip()
+        self._mapping_name = mapping
+        section = self._section_title
+        suffix = " / Section %s" % section if section else ""
+        self._mapping_label.setText(
+            "Calibrating mapping: %s%s" % (mapping,suffix)
+            if mapping else "Calibrating mapping: none%s" % suffix
         )
 
+    @property
+    def current_observation_plane(self) -> str | None:
+        value = self._observation_combo.currentData()
+        if value == _DEFINE_OBSERVATION_PLANE:
+            return None
+        return str(value).strip() if value is not None and str(value).strip() else None
 
-    def set_bound_detector(self,detector_name: str | None) -> None:
-        detector = str(detector_name or "").strip()
-        self._bound_detector = detector
-        self._detector_label.setText(
-            "Plane detector: %s" % detector
-            if detector else "Plane detector: none"
+    @property
+    def target_pixel_size_um(self) -> float | None:
+        text = self._pixel_size_edit.text().strip()
+        if not text:
+            return None
+        value = float(text)
+        if value <= 0:
+            raise ValueError("Pixel size must be > 0 um.")
+        return value
+
+    def clear_target_pixel_size_override(self) -> None:
+        self._pixel_size_edit.clear()
+
+    def _on_observation_combo_changed(self,_index: int) -> None:
+        value=self._observation_combo.currentData()
+        if value == _DEFINE_OBSERVATION_PLANE:
+            self.sigDefineObservationPlaneRequested.emit()
+            return
+        self.sigObservationPlaneChanged.emit(self.current_observation_plane)
+
+    def configure_observation_planes(
+        self,
+        observation_planes: Sequence[str],
+        current_observation_plane: str | None=None,
+        default_pixel_size_um: float | None=None,
+    ) -> None:
+        names = tuple(
+            str(value).strip() for value in observation_planes if str(value).strip()
         )
-        self.target_view.set_detector_selection_enabled(True)
-        self._refresh_detector_binding_warning()
-
-    def _refresh_detector_binding_warning(self,*_args) -> None:
-        selected = str(self.target_view.current_detector or "").strip()
-        bound = self._bound_detector
-        if bound and selected and selected != bound:
-            self._detector_label.setText(
-                'Plane detector: %s  —  using %s for this acquisition.' % (bound,selected)
+        blocker = QtCore.QSignalBlocker(self._observation_combo)
+        try:
+            self._observation_combo.clear()
+            self._observation_combo.addItem("Select observation plane...",None)
+            for name in names:
+                self._observation_combo.addItem(name,name)
+            self._observation_combo.insertSeparator(self._observation_combo.count())
+            self._observation_combo.addItem(
+                "Define new observation plane…",_DEFINE_OBSERVATION_PLANE,
             )
-            self._detector_label.setStyleSheet("color: #a66a00;")
-            self._detector_label.setToolTip(
-                'The selected detector differs from the detector stored for this plane. '
-                'Acquisition is allowed and the measurement records the selected detector.'
-            )
-        elif bound:
-            self._detector_label.setText("Plane detector: %s" % bound)
-            self._detector_label.setStyleSheet("")
-            self._detector_label.setToolTip("")
+            index = self._observation_combo.findData(current_observation_plane)
+            if index < 0:
+                index = 0
+            self._observation_combo.setCurrentIndex(index)
+        finally:
+            del blocker
+        if default_pixel_size_um is None:
+            self._pixel_size_edit.setPlaceholderText("Auto / required if unavailable")
         else:
-            self._detector_label.setText("Plane detector: none")
-            self._detector_label.setStyleSheet("")
-            self._detector_label.setToolTip("")
+            self._pixel_size_edit.setPlaceholderText(
+                "Auto (plane default %.6g)" % float(default_pixel_size_um)
+            )
+
 
     def set_live_acquisition_available(
         self,available: bool,reason: str="",
@@ -199,7 +244,6 @@ class CalibrationDialog(QtWidgets.QDialog):
         self,detectors: Sequence[str],current_detector: str | None=None,
     ) -> None:
         self.target_view.configure_detectors(detectors,current_detector)
-        self._refresh_detector_binding_warning()
 
     def set_target_available(self,available: bool,text: str="") -> None:
         self._target_available = bool(available)
@@ -324,6 +368,9 @@ class CalibrationDialog(QtWidgets.QDialog):
         self,
         localization_parameters: Mapping[str,Any],
         target_context: Mapping[str, Any] | None,
+        observation_planes: Sequence[str],
+        current_observation_plane: str | None,
+        observation_default_pixel_size_um: float | None,
         detectors: Sequence[str],
         current_detector: str | None,
     ) -> QtWidgets.QWidget:
@@ -332,17 +379,32 @@ class CalibrationDialog(QtWidgets.QDialog):
         layout.setContentsMargins(0,6,0,0)
         layout.setSpacing(8)
 
-        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal,page)
-        splitter.setChildrenCollapsible(False)
-
         context_row = QtWidgets.QHBoxLayout()
-        self._detector_label = QtWidgets.QLabel("Live acquisition detector: none")
-        detector_font = self._detector_label.font()
-        detector_font.setBold(True)
-        self._detector_label.setFont(detector_font)
-        context_row.addWidget(self._detector_label)
+        context_row.addWidget(QtWidgets.QLabel("Observation plane:"))
+        self._observation_combo = QtWidgets.QComboBox()
+        self._observation_combo.setMinimumWidth(170)
+        self._observation_combo.currentIndexChanged.connect(
+            self._on_observation_combo_changed
+        )
+        context_row.addWidget(self._observation_combo)
+        context_row.addSpacing(12)
+        context_row.addWidget(QtWidgets.QLabel("Pixel size (um):"))
+        self._pixel_size_edit = QtWidgets.QLineEdit()
+        validator = QtGui.QDoubleValidator(0.0,1e9,9,self._pixel_size_edit)
+        validator.setNotation(QtGui.QDoubleValidator.StandardNotation)
+        self._pixel_size_edit.setValidator(validator)
+        self._pixel_size_edit.setMaximumWidth(170)
+        context_row.addWidget(self._pixel_size_edit)
         context_row.addStretch(1)
         layout.addLayout(context_row)
+        self.configure_observation_planes(
+            observation_planes,
+            current_observation_plane,
+            observation_default_pixel_size_um,
+        )
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal,page)
+        splitter.setChildrenCollapsible(False)
 
         measurement_group = QtWidgets.QGroupBox("Measurement / Localization")
         measurement_layout = QtWidgets.QVBoxLayout(measurement_group)
@@ -357,7 +419,7 @@ class CalibrationDialog(QtWidgets.QDialog):
             show_accept=False,
             parent=measurement_group,
         )
-        self.target_view.set_detector_selection_enabled(False)
+        self.target_view.set_detector_selection_enabled(True)
         self.target_view.sigAcquireRequested.connect(
             lambda detector:self.sigAcquireRequested.emit(str(detector))
         )
@@ -437,11 +499,12 @@ class CalibrationDialog(QtWidgets.QDialog):
             self.sigCalibrationRequested.emit(
                 method,
                 {
-                    "plane_name":self.plane_name,
+                    "mapping_name":self.mapping_name,
                     "candidate":self._target_calibration_candidate,
                 },
             )
-            self.accept()
+            if not self._embedded:
+                self.accept()
             return
         if method != LINEAR_PHASE_METHOD:
             return
@@ -450,10 +513,11 @@ class CalibrationDialog(QtWidgets.QDialog):
         except ValueError as error:
             self._linear_status_label.setText(str(error))
             return
-        values["plane_name"] = self.plane_name
+        values["mapping_name"] = self.mapping_name
         self._linear_status_label.setText("")
         self.sigCalibrationRequested.emit(method,values)
-        self.accept()
+        if not self._embedded:
+            self.accept()
 
     def _linear_phase_values(self) -> dict[str, float]:
         result: dict[str, float] = {}

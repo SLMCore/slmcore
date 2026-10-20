@@ -304,11 +304,15 @@ class SLMPanel(QtWidgets.QWidget):
         middle_layout = QtWidgets.QVBoxLayout(middle)
         middle_layout.setContentsMargins(3,3,3,3)
         middle_layout.setSpacing(5)
-        middle_layout.setAlignment(QtCore.Qt.AlignTop)
-        middle_layout.addWidget(self.preview_panel)
-        middle_layout.addWidget(self.section_host)
+        middle_layout.addWidget(self.preview_panel,0)
+        # The sections host owns the remaining panel height.  A trailing stretch
+        # previously consumed that space instead, so Horizontal/side-by-side
+        # mode could remain stuck at the small size hint captured while all
+        # section groups were collapsed.  Keeping the host as the expanding
+        # item also preserves outer-scroll overflow when its minimum content
+        # height exceeds the viewport.
+        middle_layout.addWidget(self.section_host,1)
         self.sections_widget = self.section_host
-        middle_layout.addStretch(1)
         scroll.setWidget(middle)
         self._install_sticky_section_tabs(scroll)
         return scroll
@@ -443,13 +447,16 @@ class SLMPanel(QtWidgets.QWidget):
             height += self._outer_layout.spacing() + max(0,preview_height)
         return height
 
-    def set_status(self,text: str,error: bool=False) -> None:
+    def set_status(
+        self,text: str,error: bool=False,warning: bool=False,
+    ) -> None:
         value = str(text or "")
         if error and value:
             value = "Error: " + value
         self.status_label.set_full_text(value)
+        color = "#a33" if error else ("#a66a00" if warning else "#888")
         self.status_label.setStyleSheet(
-            "color: %s;" % ("#a33" if error else "#888")
+            "QLabel { color: %s; } QToolTip { color: white; }" % color
         )
 
     @property

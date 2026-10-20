@@ -8,6 +8,7 @@ from qtpy import QtWidgets
 
 from ...application.configuration import SLMConfigurationService,StartupRuntime
 from ...application.runtime_factory import SLMRuntimeFactory
+from ...workspace.position_reference_store import PositionReferenceStore
 from ...application.session import SLMSession
 from ...core.cgh.execution.executor import CGHExecutor
 from ...core.engine.registry import DEFAULT_REGISTRIES,SLMRegistries
@@ -57,6 +58,21 @@ class SLMQtSessionFactory:
 
         self.registries = registries
         self.workspace = workspace
+        self._position_reference_store = (
+            PositionReferenceStore()
+            if workspace is None
+            else workspace.position_reference_store
+        )
+
+    @property
+    def position_reference_store(self) -> PositionReferenceStore:
+        """Effective live reference store shared by sessions from this factory.
+
+        Workspace-backed factories use the workspace singleton. Workspace-less
+        factories retain one private in-memory store so their own sessions still
+        share session references.
+        """
+        return self._position_reference_store
 
     def create(
         self,
@@ -110,14 +126,21 @@ class SLMQtSessionFactory:
         calibration_store = (
             None if workspace is None else workspace.calibration_store
         )
-        position_reference_store = (
-            None if workspace is None else workspace.position_reference_store
+        mapping_store = (
+            None if workspace is None else workspace.mapping_store
         )
-        fov_position_calibration_store = (
-            None if workspace is None else workspace.fov_position_calibration_store
+        observation_plane_store = (
+            None if workspace is None else workspace.observation_plane_store
+        )
+        position_reference_store = self.position_reference_store
+        fov_mapping_correction_store = (
+            None if workspace is None else workspace.fov_mapping_correction_store
         )
         geometry_orientation_calibration_store = (
             None if workspace is None else workspace.geometry_orientation_calibration_store
+        )
+        observation_registration_store = (
+            None if workspace is None else workspace.observation_registration_store
         )
         runtime_factory = SLMRuntimeFactory(
             definition=definition,
@@ -176,23 +199,30 @@ class SLMQtSessionFactory:
                 configuration_service=configuration_service,
                 current_config_path=startup.config_path,
                 calibration_store=calibration_store,
+                mapping_store=mapping_store,
+                observation_plane_store=observation_plane_store,
                 position_reference_store=position_reference_store,
-                fov_position_calibration_store=fov_position_calibration_store,
+                fov_mapping_correction_store=fov_mapping_correction_store,
                 geometry_orientation_calibration_store=geometry_orientation_calibration_store,
+                observation_registration_store=observation_registration_store,
                 startup_preferences=preference_state,
                 display_name=display_name,
                 apply_startup_calibration_defaults=False,
             )
-            # Apply persistent FOV defaults before the Qt binding captures section
-            # revisions.  FOV selection is external to CGH configs but changes the
-            # effective CGH target, so applying it later through a read-only UI
-            # synchronization could leave the retained SectionView one revision
-            # behind the runtime.
+            # Restore config-owned FOV intent (schema 3+) before the Qt binding
+            # captures section state.  Legacy configs retain the historical
+            # startup-default reconciliation through the session helper.
             initial_revisions = {
                 key:snapshot.revision
                 for key,snapshot in panel.section_collection.get_section_snapshots().items()
             }
-            application_session.feedback.apply_startup_fov_position_calibration_defaults()
+            if startup.config is not None:
+                startup_fov_warnings = application_session._restore_config_fov_states(
+                    startup.config
+                )
+            else:
+                application_session.fov_mapping_runtime.apply_startup_fov_mapping_defaults()
+                startup_fov_warnings = ()
             synchronized_snapshots = application_session.runtime.get_section_snapshots()
             if any(
                 initial_revisions.get(key) != snapshot.revision
@@ -208,8 +238,13 @@ class SLMQtSessionFactory:
             )
             if startup.config_path is None:
                 application_session.calibration.apply_startup_defaults()
-            if startup.warnings:
-                panel.set_status("; ".join(startup.warnings),error=True)
+            startup_messages = list(startup.warnings)
+            startup_messages.extend(
+                str(getattr(item,"message",item))
+                for item in startup_fov_warnings
+            )
+            if startup_messages:
+                panel.set_status("; ".join(startup_messages),warning=True)
             return session,panel
         except Exception:
             if session is not None:

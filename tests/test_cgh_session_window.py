@@ -191,6 +191,9 @@ def test_cgh_group_keeps_target_in_header_and_status_in_session_dashboard():
         assert cgh.status_label is None
         assert cgh._feedback_controls.status_value_label.text() == "Current"
         assert "Intensity ×0" in cgh._feedback_controls.feedback_summary_label.text()
+        assert "Position" not in cgh._feedback_controls.feedback_summary_label.text()
+        assert cgh._feedback_controls.position_checkbox.text() == "Position"
+        assert not cgh._feedback_controls.position_checkbox.isEnabled()
         selector = cgh.param_section.metadata_field("selected_target")
         assert selector.label.text() == "Selected Target:"
         assert cgh.restore_target_button.text() == "Restore"
@@ -218,6 +221,25 @@ def test_cgh_group_keeps_target_in_header_and_status_in_session_dashboard():
             ("open_measurements_corrections",{}),
             ("clear_cgh_session",{}),
         ]
+
+        from dataclasses import replace
+        feedback_status = runtime.get_section_feedback_status(section_key)
+        view.apply_feedback_status(replace(
+            feedback_status,position_available=True,position_active=False,
+            position_stale=False,intensity_count=0,
+        ))
+        position_checkbox = cgh._feedback_controls.position_checkbox
+        assert position_checkbox.isEnabled()
+        position_checkbox.click()
+        assert actions[-1] == ("position_set_active",{"active":True})
+
+        view.apply_feedback_status(replace(
+            feedback_status,position_available=True,position_active=True,
+            position_stale=False,intensity_count=1,
+        ))
+        assert position_checkbox.isChecked()
+        assert not position_checkbox.isEnabled()
+        assert "Reset intensity feedback" in position_checkbox.toolTip()
 
         runtime.apply_section_patch(
             section_key,{
@@ -702,11 +724,13 @@ def test_position_tab_uses_right_controls_and_pending_position_is_actionable():
 
         assert (
             window.position_status_label.text()
-            == "Correction ready · hologram pending"
+            == "Applying correction · hologram pending"
         )
+        assert window.position_use_checkbox.isChecked()
+        assert not window.position_use_checkbox.isEnabled()
         assert not window.position_apply_button.isEnabled()
         assert window._compute_adapted_buttons[1].isEnabled()
-        assert window.position_clear_button.isEnabled()
+        assert not window.position_clear_button.isEnabled()
 
         legend_texts = [
             label.text()
@@ -806,48 +830,378 @@ def test_position_history_selector_separates_reference_from_intensity_rounds():
         window.deleteLater()
 
 
-def test_geometry_measurement_survives_inactive_automatic_state_refresh():
+def test_feedback_workspace_geometry_is_warning_only():
     runtime,section_key = _runtime()
     _commit_job(runtime,section_key)
     _QtWidgets,window = _window(runtime,section_key)
     try:
-        window.feedback_tabs.setCurrentIndex(2)
-        measurement = ImageMeasurement(
-            image=np.arange(64*64,dtype=np.float64).reshape(64,64),
-            source="geometry-test",
+        assert window.feedback_tabs.count() == 2
+        assert window.feedback_tabs.tabText(0) == "Intensity"
+        assert window.feedback_tabs.tabText(1) == "Position"
+
+        window.set_geometry_calibration_status(
+            observation_plane_name="sample",calibrated=False,
         )
-        window.set_geometry_orientation_calibration_state({
-            "plane_name":"sample",
-            "calibrated":False,
-            "grid_x":5,
-            "grid_y":4,
-            "period_x_px":10.0,
-            "period_y_px":12.0,
-            "metric_periods_available":False,
-            "computed":True,
-            "frame_active":True,
-            "any_frame_active":True,
-            "measurement":measurement,
-            "localization":None,
-            "localization_parameters":{},
-            "localization_context":{},
-            "analysis":None,
-            "analyze_enabled":False,
-            "save_enabled":False,
-        })
-        assert window.measurement_view.measurement is measurement
-        assert window.measurement_view._workbench.run_button.isEnabled()
+        for warning in (
+            window.intensity_geometry_warning,window.position_geometry_warning,
+        ):
+            assert not warning.isHidden()
+            assert "Geometry not calibrated for sample" in warning.text()
+            assert "Calibration → Geometry" in warning.text()
+            assert "href" not in warning.text()
 
-        # Coordinator synchronization always reapplies the automatic-operation
-        # state. When inactive, that refresh must not restore/clear the normal
-        # feedback round into the geometry-owned workbench.
-        window.set_automatic_operation_state(False)
+        window.set_geometry_calibration_status(
+            observation_plane_name="sample",calibrated=True,
+        )
+        assert window.intensity_geometry_warning.isHidden()
+        assert window.position_geometry_warning.isHidden()
+    finally:
+        window.close()
+        window.deleteLater()
 
-        assert window.measurement_view.measurement is measurement
-        assert window.measurement_view._workbench.run_button.isEnabled()
-        image = window.measurement_view._workbench.result_view._acquisition_image
-        assert image is not None
-        assert image.shape == measurement.image.shape
+def test_session_window_observation_selector_is_explicit_and_emits_selection():
+    runtime,section_key = _runtime()
+    _commit_job(runtime,section_key)
+    _app,QtWidgets,CGHSessionWindow = _qapp_and_window_class()
+    window = CGHSessionWindow(
+        status=runtime.get_section_feedback_status(section_key),
+        inspection=runtime.get_section_feedback_inspection(section_key),
+        session_inspection=runtime.get_section_cgh_session_inspection(section_key),
+        cgh_status=runtime.get_section_cgh_status(section_key),
+        localization_context=None,
+        detectors=("MainCam","IntermediateCam"),
+        current_detector="MainCam",
+        observation_planes=("Main","Intermediate"),
+        current_observation_plane=None,
+        cgh_summary=_summary(runtime,section_key),
+    )
+    emitted = []
+    window.sigActionRequested.connect(lambda action,options:emitted.append((action,options)))
+    try:
+        assert window.observation_plane_combo.currentData() is None
+        index = window.observation_plane_combo.findData("Intermediate")
+        assert index >= 0
+        window.observation_plane_combo.setCurrentIndex(index)
+        assert emitted[-1][0] == "observation_plane_set"
+        assert emitted[-1][1]["plane"] == "Intermediate"
+    finally:
+        window.close()
+        window.deleteLater()
+
+
+def _test_position_preview(cropped_image, *, crop_offset=(0.0, 0.0)):
+    image = np.asarray(cropped_image, dtype=np.float64)
+    positions = np.array(
+        [[1.0, max(1.0, image.shape[1] - 2.0)],
+         [1.0, max(1.0, image.shape[0] - 2.0)]],
+        dtype=np.float64,
+    )
+    center = np.mean(positions, axis=1)
+    return {
+        "cropped_image": image,
+        "crop_offset_px": np.asarray(crop_offset, dtype=np.float64),
+        "measured_positions_px": positions,
+        "global_positions_px": positions,
+        "reference_positions_px": positions,
+        "raw_reference_positions_px": positions,
+        "fit_center_px": center,
+        "reference_center_px": center,
+        "baseline_positions_kxy": np.zeros_like(positions),
+        "ideal_positions_kxy": np.zeros_like(positions),
+        "displacement_kxy": np.zeros_like(positions),
+        "correction_mode": "per_spot",
+        "polynomial_degree": 2,
+        "affine_transform": None,
+        "fitted_transform": None,
+    }
+
+
+def test_position_background_selector_keeps_localization_image_as_default():
+    runtime, section_key = _runtime()
+    _commit_job(runtime, section_key)
+    _attach_localized_measurement(runtime, section_key)
+    _QtWidgets, window = _window(runtime, section_key)
+    try:
+        localization_image = np.arange(20, dtype=np.float64).reshape(4, 5)
+        preview = _test_position_preview(
+            localization_image, crop_offset=(3.0, 2.0),
+        )
+        window.set_position_reference_state({
+            "mode": "current",
+            "reference_name": None,
+            "references": (),
+            "change_allowed": True,
+            "correction_mode": "per_spot",
+        }, preview)
+
+        assert window.position_background_combo.currentData() == "localization"
+        assert window.position_background_combo.findData("visual_snap") < 0
+
+        full_image = np.arange(120, dtype=np.float64).reshape(10, 12)
+        visual = ImageMeasurement(
+            image=full_image, source="test", detector="Camera",
+        )
+        window.set_position_visual_background(visual)
+
+        # Capturing a visual image must not silently replace the immutable
+        # localization-image default.
+        assert window.position_background_combo.currentData() == "localization"
+        visual_index = window.position_background_combo.findData("visual_snap")
+        assert visual_index >= 0
+        expected_crop = full_image[2:6, 3:8]
+        assert np.array_equal(window._visual_background_crop(), expected_crop)
+
+        window.position_background_combo.setCurrentIndex(visual_index)
+        assert window._position_background_mode == "visual_snap"
+        assert np.array_equal(
+            np.asarray(window.position_reference_view.image_item.image),
+            expected_crop,
+        )
+
+        localization_index = window.position_background_combo.findData("localization")
+        window.position_background_combo.setCurrentIndex(localization_index)
+        assert np.array_equal(
+            np.asarray(window.position_reference_view.image_item.image),
+            localization_image,
+        )
+    finally:
+        window.close()
+        window.deleteLater()
+
+
+def test_position_background_selector_is_only_shown_for_detector_overlay():
+    runtime, section_key = _runtime()
+    _commit_job(runtime, section_key)
+    _QtWidgets, window = _window(runtime, section_key)
+    try:
+        detector_index = window.position_view_combo.findData("detector")
+        correction_index = window.position_view_combo.findData("kxy")
+        window.position_view_combo.setCurrentIndex(detector_index)
+        assert not window.position_background_label.isHidden()
+        assert not window.position_background_combo.isHidden()
+
+        window.position_view_combo.setCurrentIndex(correction_index)
+        assert window.position_background_label.isHidden()
+        assert window.position_background_combo.isHidden()
+    finally:
+        window.close()
+        window.deleteLater()
+
+
+def test_visual_snap_action_is_capture_only_position_background_request():
+    runtime, section_key = _runtime()
+    _commit_job(runtime, section_key)
+    _attach_localized_measurement(runtime, section_key)
+    _QtWidgets, window = _window(runtime, section_key)
+    emitted = []
+    window.sigActionRequested.connect(
+        lambda action, options: emitted.append((action, dict(options)))
+    )
+    try:
+        preview = _test_position_preview(
+            np.zeros((8, 8), dtype=np.float64), crop_offset=(0.0, 0.0),
+        )
+        window.set_position_reference_state({
+            "mode": "current",
+            "reference_name": None,
+            "references": (),
+            "change_allowed": True,
+            "correction_mode": "per_spot",
+        }, preview)
+        assert window.position_visual_snap_button.isEnabled()
+
+        window.position_visual_snap_button.click()
+        assert emitted[-1] == (
+            "visual_background_acquire", {"detector": "Camera"},
+        )
+    finally:
+        window.close()
+        window.deleteLater()
+
+
+def test_position_correction_edit_controls_are_compact_and_report_edit_state():
+    runtime,section_key=_runtime()
+    _commit_job(runtime,section_key)
+    _QtWidgets,window=_window(runtime,section_key)
+    try:
+        preview=_test_position_preview(np.zeros((8,8),dtype=np.float64))
+        preview["reference"]={"mode":"current"}
+        context={
+            "mode":"current",
+            "reference_name":None,
+            "references":(),
+            "change_allowed":True,
+            "correction_mode":"affine",
+            "polynomial_degree":2,
+            "manual_transform":None,
+        }
+        window.set_position_reference_state(context,preview)
+        assert window.position_reference_interactive_edit_checkbox.text()=="Edit"
+        assert window.position_reference_reset_button.text()=="Reset"
+        assert window.position_reference_edit_state_label.text()=="Automatic"
+
+        context["manual_transform"]={
+            "model":"affine",
+            "matrix":((1.0,0.0,1.0),(0.0,1.0,0.0)),
+        }
+        window.set_position_reference_state(context,preview)
+        assert window.position_reference_edit_state_label.text()=="Edited"
+        assert window.position_reference_reset_button.isEnabled()
+    finally:
+        window.close()
+        window.deleteLater()
+
+
+def test_current_free_edit_disables_per_spot_and_enters_with_translation():
+    runtime,section_key=_runtime()
+    _commit_job(runtime,section_key)
+    _QtWidgets,window=_window(runtime,section_key)
+    emitted=[]
+    window.sigActionRequested.connect(
+        lambda action,options:emitted.append((action,dict(options)))
+    )
+    try:
+        preview=_test_position_preview(np.zeros((8,8),dtype=np.float64))
+        window.set_position_reference_state({
+            "mode":"global_fit",
+            "reference_name":None,
+            "references":(),
+            "change_allowed":True,
+            "correction_mode":"per_spot",
+            "polynomial_degree":2,
+            "manual_transform":None,
+        },preview)
+
+        current_index=window.position_reference_combo.findData("current")
+        assert current_index>=0
+        window.position_reference_combo.setCurrentIndex(current_index)
+        assert emitted[-1][0]=="position_reference_set"
+        assert emitted[-1][1]["mode"]=="current"
+        assert emitted[-1][1]["correction_mode"]=="translation"
+
+        window.set_position_reference_state({
+            "mode":"current",
+            "reference_name":None,
+            "references":(),
+            "change_allowed":True,
+            "correction_mode":"translation",
+            "polynomial_degree":2,
+            "manual_transform":None,
+        },preview)
+        per_spot_index=window.position_reference_correction_model_combo.findData(
+            "per_spot"
+        )
+        item=window.position_reference_correction_model_combo.model().item(
+            per_spot_index
+        )
+        assert item is not None
+        assert not item.isEnabled()
+    finally:
+        window.close()
+        window.deleteLater()
+
+
+def test_current_free_edit_summary_reports_displacement_not_residual():
+    runtime,section_key=_runtime()
+    _commit_job(runtime,section_key)
+    _QtWidgets,window=_window(runtime,section_key)
+    try:
+        preview=_test_position_preview(np.zeros((8,8),dtype=np.float64))
+        preview["reference"]={"mode":"current"}
+        preview["reference_positions_px"]=(
+            np.asarray(preview["measured_positions_px"],dtype=np.float64)
+            + np.asarray([[1.0],[0.0]])
+        )
+        window.set_position_reference_state({
+            "mode":"current",
+            "reference_name":None,
+            "references":(),
+            "change_allowed":True,
+            "correction_mode":"translation",
+            "polynomial_degree":2,
+            "manual_transform":None,
+        },preview)
+        text=window.position_reference_view.summary_label.text()
+        assert "displacement median" in text
+        assert "displacement RMS" in text
+        assert "residual" not in text
+    finally:
+        window.close()
+        window.deleteLater()
+
+
+def test_feedback_state_does_not_redraw_unchanged_committed_localization():
+    runtime,section_key = _runtime()
+    _commit_job(runtime,section_key)
+    _attach_localized_measurement(runtime,section_key)
+    _QtWidgets,window = _window(runtime,section_key)
+    try:
+        committed=window.measurement_view.committed_result
+        assert committed is not None
+        calls=[]
+        original=window.measurement_view.set_committed_result
+        def counted(*args,**kwargs):
+            calls.append(args[0])
+            return original(*args,**kwargs)
+        window.measurement_view.set_committed_result=counted
+        window.set_feedback_state(
+            runtime.get_section_feedback_status(section_key),
+            runtime.get_section_feedback_inspection(section_key),
+            None,
+        )
+        assert calls == []
+        assert window.measurement_view.committed_result is committed
+    finally:
+        window.close()
+        window.deleteLater()
+
+
+def test_metrics_refresh_reuses_unchanged_integration_preview():
+    from types import SimpleNamespace
+
+    runtime,section_key = _runtime()
+    _commit_job(runtime,section_key)
+    _QtWidgets,window = _window(runtime,section_key)
+    try:
+        preview=np.arange(20,dtype=np.float64).reshape(4,5)
+        metrics=SimpleNamespace(values={},integration_preview=preview)
+        calls=[]
+        original=window.measurement_view.set_auxiliary_image
+        def counted(name,image):
+            calls.append((name,image))
+            return original(name,image)
+        window.measurement_view.set_auxiliary_image=counted
+        window._refresh_metrics_display(metrics)
+        window._refresh_metrics_display(metrics)
+        assert len(calls) == 1
+        assert calls[0][0] == "Integration"
+        assert calls[0][1] is preview
+    finally:
+        window.close()
+        window.deleteLater()
+
+
+def test_reference_refresh_does_not_reapply_localization_background():
+    runtime,section_key = _runtime()
+    _commit_job(runtime,section_key)
+    _attach_localized_measurement(runtime,section_key)
+    _QtWidgets,window = _window(runtime,section_key)
+    try:
+        preview=_test_position_preview(np.arange(20,dtype=np.float64).reshape(4,5))
+        calls=[]
+        original=window._apply_position_background_image
+        def counted():
+            calls.append(True)
+            return original()
+        window._apply_position_background_image=counted
+        window.set_position_reference_state({
+            "mode":"current",
+            "reference_name":None,
+            "references":(),
+            "change_allowed":True,
+            "correction_mode":"per_spot",
+        },preview,lightweight=True)
+        assert calls == []
     finally:
         window.close()
         window.deleteLater()

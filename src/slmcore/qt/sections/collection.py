@@ -25,10 +25,7 @@ class SectionsCollectionView(QtCore.QObject):
 
     sigSectionPatchRequested = QtCore.Signal(str,object)
     sigSectionTopologyRequested = QtCore.Signal(str,object)
-    sigActivePlaneRequested = QtCore.Signal(str,str)
-    sigAddPlaneRequested = QtCore.Signal(str)
-    sigDeletePlaneRequested = QtCore.Signal(str,str)
-    sigDeleteCalibrationRequested = QtCore.Signal(str,str)
+    sigActiveMappingRequested = QtCore.Signal(str,str)
     sigCalibrationRequested = QtCore.Signal(str)
     sigCghActionRequested = QtCore.Signal(str,str,object)
     sigTargetLockRequested = QtCore.Signal(str,str,object)
@@ -143,15 +140,15 @@ class SectionsCollectionView(QtCore.QObject):
         """Restore one retained section from an authoritative snapshot."""
         self.section_view(section_key).restore_snapshot(snapshot)
 
-    def set_available_planes(
-        self,section_key: str,plane_names,active_plane: str | None=None,
+    def set_available_mappings(
+        self,section_key: str,mapping_names,active_mapping: str | None=None,
     ) -> None:
-        self.section_view(section_key).set_available_planes(
-            plane_names,active_plane,
+        self.section_view(section_key).set_available_mappings(
+            mapping_names,active_mapping,
         )
 
-    def get_active_plane(self,section_key: str) -> str | None:
-        return self.section_view(section_key).get_active_plane()
+    def get_active_mapping(self,section_key: str) -> str | None:
+        return self.section_view(section_key).get_active_mapping()
 
     def set_cgh_target_presentation(
         self,section_key: str,summary: Mapping[str,Any],
@@ -163,13 +160,16 @@ class SectionsCollectionView(QtCore.QObject):
     ) -> None:
         self.section_view(section_key).set_cgh_computing(computing)
 
+    def set_cgh_status(self,section_key: str,status) -> None:
+        self.section_view(section_key).apply_cgh_status(status)
+
     def set_feedback_status(self,section_key: str,status) -> None:
         self.section_view(section_key).apply_feedback_status(status)
 
-    def set_fov_position_calibration_context(
+    def set_fov_mapping_correction_context(
         self,section_key: str,context,
     ) -> None:
-        self.section_view(section_key).set_fov_position_calibration_context(
+        self.section_view(section_key).set_fov_mapping_correction_context(
             context
         )
 
@@ -209,17 +209,8 @@ class SectionsCollectionView(QtCore.QObject):
         view.sigTopologyRequested.connect(
             self.sigSectionTopologyRequested.emit,
         )
-        view.sigActivePlaneRequested.connect(
-            self.sigActivePlaneRequested.emit,
-        )
-        view.sigAddPlaneRequested.connect(
-            self.sigAddPlaneRequested.emit,
-        )
-        view.sigDeletePlaneRequested.connect(
-            self.sigDeletePlaneRequested.emit,
-        )
-        view.sigDeleteCalibrationRequested.connect(
-            self.sigDeleteCalibrationRequested.emit,
+        view.sigActiveMappingRequested.connect(
+            self.sigActiveMappingRequested.emit,
         )
         view.sigCalibrationRequested.connect(
             self.sigCalibrationRequested.emit,

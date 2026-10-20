@@ -23,9 +23,6 @@ from ...core.engine.state.items import CGHTargetState,ItemState
 from ..widgets.binding import ParameterBinding
 from ..cgh.session_views import format_target_summary
 from ..widgets.fields import ParamForm
-from ..application.interaction import (
-    ParameterCommitMode,is_group_target_parameter_path,
-)
 from ..widgets.param_section import PARAM_ACTIVE_KEY,ParamSection
 from .policy import RenderPolicy
 
@@ -41,14 +38,10 @@ class CghAction(str,Enum):
     COMPUTE = "compute"
     RESTORE_CURRENT_TARGET = "restore_current_target"
     TARGET_PREVIEW = "target_preview"
-    METRICS = "metrics"
-    PROPAGATION = "propagation"
     CLEAR_CGH_SESSION = "clear_cgh_session"
     OPEN_MEASUREMENTS_CORRECTIONS = "open_measurements_corrections"
-    FOV_CALIBRATION_SELECT = "fov_calibration_select"
-    FOV_CALIBRATION_APPLY = "fov_calibration_apply"
-    FOV_CALIBRATION_SET_DEFAULT = "fov_calibration_set_default"
-    FOV_CALIBRATION_DELETE = "fov_calibration_delete"
+    FOV_MAPPING_APPLY = "fov_mapping_apply"
+    POSITION_SET_ACTIVE = "position_set_active"
 
 
 def visible_specs(
@@ -107,6 +100,7 @@ class FeedbackControls:
     container: QtWidgets.QWidget
     status_value_label: QtWidgets.QLabel
     feedback_summary_label: QtWidgets.QLabel
+    position_checkbox: QtWidgets.QCheckBox
     open_button: QtWidgets.QPushButton
 
 
@@ -131,6 +125,14 @@ class BaseGroupView:
         self._conversion_context = conversion_context
         self._on_edit = on_edit
         self._on_action: Callable[[str, Mapping[str, Any]], None] | None = None
+        self._focused_presentation = False
+        self._focused_item_keys: tuple[str,...] | None = None
+        self._local_form: ParamForm | None = None
+        self._item_forms: dict[str,ParamForm] = {}
+        self._item_widgets: dict[str,QtWidgets.QWidget] = {}
+        self._item_widget_styles: dict[str,str] = {}
+        self._item_widget_flat_states: dict[str,bool] = {}
+        self._last_state: StateModel = entry.state
 
         local_specs = visible_specs(entry.state,render_policy)
         active_spec,remaining = pop_active_spec(local_specs)
@@ -183,6 +185,7 @@ class BaseGroupView:
             editor_width=70,show_complementary=False,
         )
         self.binding.bind_form(form,(),self._emit_edit)
+        self._local_form = form
         return form
 
     def _create_item_form(
@@ -205,6 +208,7 @@ class BaseGroupView:
             show_complementary=False,mount=False,
         )
         self.binding.bind_form(form,prefix,self._emit_edit)
+        self._item_forms[form_name] = form
         return form
 
     def _add_item_form(
@@ -222,7 +226,11 @@ class BaseGroupView:
         )
         if form is None:
             return None
-        return add_form_to_group_box(form,title)
+        box = add_form_to_group_box(form,title)
+        self._item_widgets[form_name] = box
+        self._item_widget_styles[form_name] = box.styleSheet()
+        self._item_widget_flat_states[form_name] = bool(box.isFlat())
+        return box
 
     def _emit_edit(self,path: ParamPath,value: Any) -> None:
         self._emit_edits({tuple(path):value})
@@ -248,13 +256,89 @@ class BaseGroupView:
             self._on_action(action.value,dict(options or {}))
 
     def apply_state(self,state: StateModel) -> None:
+        self._last_state = state
         self.binding.apply_state(state)
         self.param_section.refresh_summary()
+        self._refresh_focused_parent_state()
+
+    def available_focused_item_keys(
+        self,item_keys,
+    ) -> tuple[str,...]:
+        return tuple(
+            str(key) for key in tuple(item_keys or ())
+            if str(key) in self._item_forms
+        )
+
+    def set_focused_presentation(
+        self,enabled: bool,*,item_keys: tuple[str,...] | None=None,
+    ) -> None:
+        """Apply a presentation-only focused projection of this group."""
+        enabled = bool(enabled)
+        normalized_items = (
+            None if item_keys is None
+            else tuple(str(key) for key in item_keys)
+        )
+        self._focused_presentation = enabled
+        self._focused_item_keys = normalized_items if enabled else None
+        self.param_section.set_flat_mode(enabled)
+
+        if self._local_form is not None:
+            self._local_form.set_presentation_visible(
+                not enabled or normalized_items is None
+            )
+
+        selected = None if normalized_items is None else set(normalized_items)
+        for key,form in self._item_forms.items():
+            visible = (not enabled) or selected is None or key in selected
+            form.set_presentation_visible(visible)
+        for key,widget in self._item_widgets.items():
+            visible = (not enabled) or selected is None or key in selected
+            widget.setVisible(visible)
+            self._set_item_widget_focused_chrome(key,widget,enabled)
+
+        self._refresh_focused_parent_state()
+
+    def _set_item_widget_focused_chrome(
+        self,key: str,widget: QtWidgets.QWidget,enabled: bool,
+    ) -> None:
+        if not isinstance(widget,QtWidgets.QGroupBox):
+            return
+        if enabled:
+            widget.setFlat(True)
+            widget.setStyleSheet(
+                "QGroupBox { border: none; margin-top: 1.15em; padding-top: 2px; }"
+                "QGroupBox::title {"
+                " subcontrol-origin: margin; left: 0px; padding: 0px 2px;"
+                "}"
+            )
+        else:
+            widget.setFlat(self._item_widget_flat_states.get(key,False))
+            widget.setStyleSheet(self._item_widget_styles.get(key,""))
+
+
+    def _refresh_focused_parent_state(self) -> None:
+        content = self.widget.contentWidget
+        if content is None:
+            return
+        blocked = (
+            self._focused_presentation
+            and not self.param_section.is_active()
+        )
+        content.setEnabled(not blocked)
+        tooltip = (
+            f"{self._last_state.title()} is inactive. "
+            "Switch to Full editing to change section state."
+            if blocked else ""
+        )
+        content.setToolTip(tooltip)
+        self.widget.contentArea.viewport().setToolTip(tooltip)
+        self.widget.setToolTip(tooltip)
 
     def set_parameter(self,path: ParamPath,value: Any) -> bool:
         changed = self.binding.set_parameter(path,value)
         if changed:
             self.param_section.refresh_summary()
+            self._refresh_focused_parent_state()
         return changed
 
     def set_unit_mode(self,mode: str) -> None:
@@ -351,10 +435,7 @@ class CghGroupView(BaseGroupView):
         self.restore_target_button: QtWidgets.QPushButton | None = None
         self.auto_recompute_checkbox: QtWidgets.QCheckBox | None = None
         self.preview_button: QtWidgets.QPushButton | None = None
-        self.metrics_button: QtWidgets.QPushButton | None = None
-        self.propagation_button: QtWidgets.QPushButton | None = None
         self.clear_button: QtWidgets.QPushButton | None = None
-        self.propagation_pad_size: QtWidgets.QSpinBox | None = None
         self._action_widget: QtWidgets.QWidget | None = None
         self._action_host_layout: QtWidgets.QGridLayout | None = None
         self._computation_boxes: dict[str, QtWidgets.QGroupBox] = {}
@@ -370,13 +451,6 @@ class CghGroupView(BaseGroupView):
         self._status: Any = None
         self._feedback_status: FeedbackStatus | None = None
         self._target_presentation: dict[str, Any] = {}
-        self._fov_calibration_context: dict[str,Any] = {}
-        self.fov_calibration_checkbox: QtWidgets.QCheckBox | None = None
-        self.fov_calibration_combo: QtWidgets.QComboBox | None = None
-        self.fov_calibration_more_button: QtWidgets.QToolButton | None = None
-        self.fov_calibration_set_default_action: QtWidgets.QAction | None = None
-        self.fov_calibration_delete_action: QtWidgets.QAction | None = None
-        self.fov_calibration_info_label: QtWidgets.QLabel | None = None
         self._target_param_specs: dict[str, Mapping[str, ParamSpec]] = {}
         self._unit_mode = SLM_UNIT
         self._computing = False
@@ -545,12 +619,6 @@ class CghGroupView(BaseGroupView):
         )
         self.param_section.layout.setColumnStretch(0,1)
 
-        # Target spinboxes defer free-form typed text until editingFinished,
-        # while arrow/key/wheel stepping remains live through valueChanged.
-        for path,field in self.binding.fields.items():
-            if is_group_target_parameter_path(path):
-                field.set_commit_mode(ParameterCommitMode.EDIT_FINISHED)
-
         if selector is not None and isinstance(
             selector.editor,QtWidgets.QComboBox,
         ):
@@ -648,6 +716,11 @@ class CghGroupView(BaseGroupView):
         self._lock_states[target_key] = LatticeLockState(
             kind=lock.kind,
             reference=(None if lock.reference is None else tuple(lock.reference)),
+            period_fov_reference=(
+                None
+                if lock.period_fov_reference is None
+                else tuple(lock.period_fov_reference)
+            ),
         )
         self._lock_states[target_key].validate()
         self._set_lattice_lock_button_checks(target_key,lock.kind)
@@ -657,13 +730,13 @@ class CghGroupView(BaseGroupView):
                 label = "FOV" if name == "fov" else "Foci count"
                 button.setToolTip(
                     f"{label} reference locked: X={x:g}, Y={y:g}. "
-                    "Click to unlock. Realized values may differ after rasterization."
+                    "Click to unlock. Realized values may differ after reconciliation."
                 )
             else:
                 label = "FOV" if name == "fov" else "foci count"
                 button.setToolTip(
                     f"Keep the current X/Y {label} as the reference across "
-                    "subsequent raster target changes."
+                    "subsequent lattice target changes."
                 )
 
     def sync_target_lock_states(self,state: CGHState) -> None:
@@ -730,10 +803,28 @@ class CghGroupView(BaseGroupView):
         feedback_title = QtWidgets.QLabel("Feedback:")
         grid.addWidget(feedback_title,1,0,alignment=QtCore.Qt.AlignVCenter)
 
+        feedback_cell = QtWidgets.QWidget()
+        feedback_layout = QtWidgets.QHBoxLayout(feedback_cell)
+        feedback_layout.setContentsMargins(0,0,0,0)
+        feedback_layout.setSpacing(7)
+
         feedback_summary = QtWidgets.QLabel("None")
         feedback_summary.setStyleSheet("color: #888;")
+        feedback_summary.setSizePolicy(
+            QtWidgets.QSizePolicy.Maximum,QtWidgets.QSizePolicy.Preferred,
+        )
+        feedback_layout.addWidget(feedback_summary)
+
+        position_checkbox = QtWidgets.QCheckBox("Position")
+        position_checkbox.toggled.connect(
+            lambda checked:self._emit_action(
+                CghAction.POSITION_SET_ACTIVE,{"active":bool(checked)},
+            )
+        )
+        feedback_layout.addWidget(position_checkbox)
+        feedback_layout.addStretch(1)
         grid.addWidget(
-            feedback_summary,1,1,alignment=(
+            feedback_cell,1,1,alignment=(
                 QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter
             ),
         )
@@ -755,148 +846,14 @@ class CghGroupView(BaseGroupView):
         self.clear_button = clear
         grid.addWidget(clear,1,3)
 
-        fov_title = QtWidgets.QLabel("FOV calibration:")
-        grid.addWidget(fov_title,2,0,alignment=QtCore.Qt.AlignVCenter)
-
-        fov_cell = QtWidgets.QWidget()
-        fov_layout = QtWidgets.QHBoxLayout(fov_cell)
-        fov_layout.setContentsMargins(0,0,0,0)
-        fov_layout.setSpacing(5)
-        fov_apply = QtWidgets.QCheckBox("Apply")
-        fov_apply.toggled.connect(
-            lambda value:self._emit_action(
-                CghAction.FOV_CALIBRATION_APPLY,{"applied":bool(value)},
-            )
-        )
-        fov_combo = QtWidgets.QComboBox()
-        fov_combo.setMinimumWidth(135)
-        fov_combo.currentIndexChanged.connect(self._on_fov_calibration_selected)
-
-        fov_more = QtWidgets.QToolButton()
-        fov_more.setText("⋯")
-        fov_more.setFixedSize(24,18)
-        fov_more.setPopupMode(QtWidgets.QToolButton.InstantPopup)
-        fov_more.setToolTip("FOV calibration actions")
-        fov_menu = QtWidgets.QMenu(fov_more)
-        fov_default_action = fov_menu.addAction("Set as default")
-        fov_delete_action = fov_menu.addAction("Delete calibration…")
-        fov_default_action.triggered.connect(
-            lambda _checked=False:self._emit_action(
-                CghAction.FOV_CALIBRATION_SET_DEFAULT,
-            )
-        )
-        fov_delete_action.triggered.connect(
-            self._delete_fov_calibration_requested
-        )
-        fov_more.setMenu(fov_menu)
-
-        fov_layout.addWidget(fov_apply)
-        fov_layout.addWidget(fov_combo,1)
-        fov_layout.addWidget(fov_more)
-        grid.addWidget(fov_cell,2,1,1,2)
-
-        fov_info = QtWidgets.QLabel("")
-        fov_info.setStyleSheet("color: #888;")
-        grid.addWidget(fov_info,2,3,1,2)
-
-        self.fov_calibration_checkbox = fov_apply
-        self.fov_calibration_combo = fov_combo
-        self.fov_calibration_more_button = fov_more
-        self.fov_calibration_set_default_action = fov_default_action
-        self.fov_calibration_delete_action = fov_delete_action
-        self.fov_calibration_info_label = fov_info
-
         self._feedback_controls = FeedbackControls(
             container=widget,
             status_value_label=status_value,
             feedback_summary_label=feedback_summary,
+            position_checkbox=position_checkbox,
             open_button=open_button,
         )
-        self._refresh_fov_calibration_controls()
         return widget
-
-    def set_fov_position_calibration_context(
-        self,context: Mapping[str,Any] | None,
-    ) -> None:
-        self._fov_calibration_context = dict(context or {})
-        self._refresh_fov_calibration_controls()
-
-    def _on_fov_calibration_selected(self,_index: int) -> None:
-        combo = self.fov_calibration_combo
-        if combo is None:
-            return
-        self._emit_action(
-            CghAction.FOV_CALIBRATION_SELECT,{"name":combo.currentData()},
-        )
-
-    def _delete_fov_calibration_requested(self,*_args: Any) -> None:
-        context = dict(self._fov_calibration_context or {})
-        name = str(context.get("selected_name") or "").strip()
-        if not name:
-            return
-        answer = QtWidgets.QMessageBox.question(
-            self.widget,
-            "Delete FOV calibration",
-            'Delete FOV calibration "%s"?\n\nThis cannot be undone.' % name,
-            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-            QtWidgets.QMessageBox.No,
-        )
-        if answer == QtWidgets.QMessageBox.Yes:
-            self._emit_action(CghAction.FOV_CALIBRATION_DELETE)
-
-    def _refresh_fov_calibration_controls(self) -> None:
-        checkbox = self.fov_calibration_checkbox
-        combo = self.fov_calibration_combo
-        more = self.fov_calibration_more_button
-        default_action = self.fov_calibration_set_default_action
-        delete_action = self.fov_calibration_delete_action
-        info = self.fov_calibration_info_label
-        if (
-            checkbox is None or combo is None or more is None
-            or default_action is None or delete_action is None or info is None
-        ):
-            return
-        context = dict(self._fov_calibration_context or {})
-        supported = bool(context.get("supported",False))
-        names = tuple(context.get("available_names",()) or ())
-        selected = context.get("selected_name")
-        blocker = QtCore.QSignalBlocker(combo)
-        try:
-            combo.clear()
-            combo.addItem("None",None)
-            for name in names:
-                combo.addItem(str(name),str(name))
-            index = combo.findData(selected)
-            combo.setCurrentIndex(index if index >= 0 else 0)
-        finally:
-            del blocker
-        blocker = QtCore.QSignalBlocker(checkbox)
-        try:
-            checkbox.setChecked(bool(context.get("applied",False)))
-        finally:
-            del blocker
-        manageable = bool(context.get("plane_name")) and not self._computing
-        combo.setEnabled(manageable)
-        checkbox.setEnabled(manageable and supported and bool(selected))
-        more.setEnabled(manageable and bool(selected))
-        default_action.setEnabled(manageable and bool(selected))
-        delete_action.setEnabled(manageable and bool(selected))
-        default = context.get("default_name")
-        extrapolated = int(context.get("extrapolated_count",0) or 0)
-        if not supported:
-            text = "Not supported by current target"
-        elif extrapolated:
-            text = "Extrapolating %d/%d spots" % (
-                extrapolated,int(context.get("target_count",0) or 0),
-            )
-        elif selected and default == selected:
-            text = "Default"
-        else:
-            text = ""
-        info.setText(text)
-        info.setStyleSheet(
-            "color: #a66a00;" if extrapolated else "color: #888;"
-        )
 
     def auto_recompute_enabled(self) -> bool:
         checkbox = self.auto_recompute_checkbox
@@ -961,39 +918,69 @@ class CghGroupView(BaseGroupView):
         }.get(result_state,"color: #888;"))
 
         capabilities = set(self._feedback_capabilities.get(selected,()))
-        parts = []
-        if selected is not None and capabilities and status is not None:
-            if FeedbackCapability.INTENSITY in capabilities:
-                parts.append("Intensity ×%d" % status.intensity_count)
-            if FeedbackCapability.POSITION_CORRECTION in capabilities:
-                parts.append(
-                    "Position %s" % ("ON" if status.position_active else "OFF")
-                )
-        controls.feedback_summary_label.setText(
-            " · ".join(parts) if parts else "None"
-        )
+        has_intensity = FeedbackCapability.INTENSITY in capabilities
+        has_position = FeedbackCapability.POSITION_CORRECTION in capabilities
+        if selected is not None and status is not None and has_intensity:
+            feedback_text = "Intensity ×%d" % status.intensity_count
+        elif selected is not None and status is not None and has_position:
+            feedback_text = ""
+        else:
+            feedback_text = "None"
+        controls.feedback_summary_label.setText(feedback_text)
         controls.feedback_summary_label.setToolTip(
             self._feedback_status_tooltip(status)
             if selected is not None and capabilities else ""
         )
 
+        checkbox = controls.position_checkbox
+        blocker = QtCore.QSignalBlocker(checkbox)
+        checkbox.setChecked(bool(status is not None and status.position_active))
+        del blocker
+        checkbox.setVisible(bool(selected is not None and has_position))
+        position_enabled = bool(
+            selected is not None
+            and has_position
+            and status is not None
+            and status.position_available
+            and not status.position_stale
+            and not status.adaptation_pending
+            and not status.feedback_compute_pending
+            and int(status.intensity_count) == 0
+            and not self._computing
+        )
+        checkbox.setEnabled(position_enabled)
+        if not has_position:
+            position_tip = ""
+        elif status is None:
+            position_tip = "No position-correction state is available."
+        elif int(status.intensity_count) > 0:
+            position_tip = (
+                "Reset intensity feedback before changing position correction."
+            )
+        elif status.position_stale:
+            position_tip = (
+                str(status.position_stale_reason).strip()
+                or "The stored position correction is stale."
+            )
+        elif not status.position_available:
+            position_tip = (
+                "No stored position correction is available. Open the session "
+                "to create one."
+            )
+        elif status.adaptation_pending or status.feedback_compute_pending:
+            position_tip = "Wait for the pending feedback update to finish."
+        elif self._computing:
+            position_tip = "CGH computation is in progress."
+        else:
+            position_tip = (
+                "Use or temporarily disable the stored position correction. "
+                "The CGH is recomputed automatically."
+            )
+        checkbox.setToolTip(position_tip)
 
         # Opening the workspace is also how a future saved session is loaded,
         # so it must not depend on a currently selected target.
         controls.open_button.setEnabled(not self._computing)
-
-    def _selected_target_summary_text(self) -> str:
-        data = self._target_presentation
-        presentation = data.get("target_presentation")
-        if presentation is None:
-            return ""
-        return format_target_summary(
-            presentation,
-            data.get("target_params") or {},
-            data.get("target_param_specs") or {},
-            unit_mode=self._unit_mode,
-            conversion_context=self._conversion_context(),
-        )
 
     @staticmethod
     def _feedback_status_tooltip(status: FeedbackStatus | None) -> str:
@@ -1047,15 +1034,6 @@ class CghGroupView(BaseGroupView):
 
     def _request_compute(self,_checked: bool=False) -> None:
         self._emit_action(CghAction.COMPUTE)
-
-    def _request_propagation(self,_checked: bool=False) -> None:
-        pad_size = (
-            self.propagation_pad_size.value()
-            if self.propagation_pad_size is not None else 1024
-        )
-        self._emit_action(
-            CghAction.PROPAGATION,{"pad_size":int(pad_size)},
-        )
 
     def set_parameter(self,path: ParamPath,value: Any) -> bool:
         changed = super().set_parameter(path,value)
@@ -1122,7 +1100,6 @@ class CghGroupView(BaseGroupView):
     def set_computing(self,computing: bool) -> None:
         self._computing = bool(computing)
         self._refresh_action_controls()
-        self._refresh_fov_calibration_controls()
 
     def _refresh_compute_button_presentation(self) -> None:
         button = self.compute_button
@@ -1183,15 +1160,8 @@ class CghGroupView(BaseGroupView):
                 and selected is not None
                 and not self._computing
             )
-        for button in (
-            self.metrics_button,self.propagation_button,self.clear_button,
-        ):
-            if button is not None:
-                button.setEnabled(has_result and not self._computing)
-        if self.propagation_pad_size is not None:
-            self.propagation_pad_size.setEnabled(
-                has_result and not self._computing
-            )
+        if self.clear_button is not None:
+            self.clear_button.setEnabled(has_result and not self._computing)
         self._refresh_feedback_controls()
         self._refresh_auto_recompute_availability()
 

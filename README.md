@@ -10,9 +10,29 @@ Host applications should use the public `slmcore` interfaces rather than maintai
 
 `slmcore` requires Python 3.10 or newer.
 
-### Core development
+### Installation from PyPI
 
-The standard development environment does not require Qt.
+Install the host-independent core package with:
+
+```bash
+python -m pip install slmcore
+```
+
+Install the reusable Qt interface when `slmcore` is used as its own Qt application or from a host that does not already provide the required Qt stack:
+
+```bash
+python -m pip install "slmcore[qt]"
+```
+
+Importing `slmcore` itself does not import Qt. Qt functionality is accessed explicitly through `slmcore.qt`.
+
+### Optional GPU acceleration
+
+The CGH backends can use CuPy for GPU acceleration when a compatible CUDA/CuPy installation is available. GPU support is optional; the package falls back to CPU implementations when CuPy is unavailable.
+
+CuPy publishes different binary packages for different CUDA major versions, so `slmcore` deliberately does not declare a generic `gpu` extra. Install the CuPy package appropriate for the CUDA environment by following the CuPy installation instructions, then install `slmcore` normally. The runtime GPU availability probe will expose the GPU backend only when CuPy and CUDA can execute successfully.
+
+### Core development
 
 From a source checkout, create and activate a Python environment, then install:
 
@@ -26,9 +46,7 @@ python -m pip install -r requirements-dev.txt
 -e .[test]
 ```
 
-This installs `slmcore` in editable mode together with its test dependencies, but without the optional Qt stack.
-
-Changes under `src/slmcore/` are immediately available without reinstalling the package.
+This installs `slmcore` in editable mode together with its test dependencies, but without the optional Qt stack. Changes under `src/slmcore/` are immediately available without reinstalling the package.
 
 Run the test suite with:
 
@@ -38,43 +56,37 @@ python -m pytest
 
 The non-Qt tests run normally. Qt-specific tests are skipped when the Qt dependencies are not installed.
 
-This is the appropriate environment for development of the core, application, setup, workspace, and host-independent parts of `slmcore`.
+### Qt development and standalone demo
 
-### Qt development and standalone application
-
-To develop or use the Qt interface, install both the Qt and test dependency groups:
+To develop the reusable Qt interface and run the full test suite, install:
 
 ```bash
 python -m pip install -e ".[qt,test]"
 ```
 
-This installs the same editable `slmcore` package together with the dependencies required by `slmcore.qt`.
-
-The full test suite, including Qt tests, can then be run with:
+The standalone demo additionally uses QDarkStyle for its reference-host theme. It is intentionally kept out of the reusable `qt` dependency group. Install the demo dependencies with:
 
 ```bash
-python -m pytest
+python -m pip install -e ".[qt,demo,test]"
 ```
 
-Run the hardware-free standalone Qt demo with:
+Then run:
 
 ```bash
 python -m examples.qt_demo
 ```
 
-The demo uses mock SLM devices and does not require physical hardware. It also provides reference examples for setup files, multiple SLMs, workspace handling, session composition, and host integration.
+The demo uses mock SLM devices and does not require physical hardware. It also provides reference examples for setup files, multiple SLMs, workspace handling, session composition, and host integration. The `examples/` tree is distributed with the source distribution rather than installed as part of the `slmcore` wheel.
 
-### Minimal installation
+### Minimal source installation
 
-If tests and Qt are not required, the base package can be installed directly from a source checkout:
+If tests and Qt are not required, the base package can be installed from a source checkout in editable mode:
 
 ```bash
 python -m pip install -e .
 ```
 
-The base package contains the SLM runtime, computation, configuration, workspace, setup, and host APIs without installing the optional Qt dependencies.
-
-Importing `slmcore` itself does not import Qt. Qt functionality is accessed explicitly through `slmcore.qt`.
+The base package contains the SLM runtime, computation, configuration, workspace, setup, and host APIs without installing optional Qt or demo dependencies.
 
 ### Minimal standalone Qt composition
 
@@ -85,10 +97,10 @@ from qtpy import QtWidgets
 
 from slmcore import (
     SectionSplitLayout,
+    SLMDefinition,
     SLMGeometry,
     SLMIdentity,
-    SLMSectionsSetup,
-    SLMSetup,
+    SLMSectionsDefinition,
     SLMWorkspace,
 )
 from slmcore.host import MockSLMDeviceProvider, SLMHostServices
@@ -97,7 +109,7 @@ from slmcore.qt import SLMQtSessionFactory
 
 app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
-setup = SLMSetup(
+definition = SLMDefinition(
     identity=SLMIdentity(
         key="slm",
         serial_number="example-serial",
@@ -108,7 +120,7 @@ setup = SLMSetup(
         height=1080,
         pixel_size_um=8.0,
     ),
-    sections=SLMSectionsSetup(
+    sections=SLMSectionsDefinition(
         layout=SectionSplitLayout(n_sections=1),
     ),
 )
@@ -117,7 +129,7 @@ workspace = SLMWorkspace("slm_data")
 factory = SLMQtSessionFactory(workspace=workspace)
 
 session, panel = factory.create(
-    setup=setup,
+    definition=definition,
     host_services=SLMHostServices(
         device=MockSLMDeviceProvider(),
     ),
@@ -130,7 +142,7 @@ panel.show()
 app.exec()
 ```
 
-A standalone application that uses a canonical setup JSON file can instead provide `setup_file=...` to `SLMQtSessionFactory.create()`. In that case, `slmcore` can persist startup preferences directly in that setup file.
+When using a canonical setup JSON file, load it first with `load_slm_setup_file()` and pass the resulting `SLMDefinition` and `SLMStartupPreferences` to `create()`. Passing the same `setup_file=...` lets the factory persist later startup-preference changes back into that file.
 
 For the complete standalone reference host, see:
 
@@ -174,7 +186,7 @@ ImSwitch/slmcore/src/slmcore/
 ImSwitch can therefore use the public API normally:
 
 ```python
-from slmcore import SLMSetup, SLMStartupPreferences, SLMWorkspace
+from slmcore import SLMDefinition, SLMStartupPreferences, SLMWorkspace
 from slmcore.host import SLMDeviceProvider, SLMHostServices
 from slmcore.qt import SLMQtSessionFactory
 ```
@@ -191,18 +203,22 @@ The public `slmcore` repository can therefore remain usable independently while 
 
 Package dependencies are defined in `pyproject.toml`.
 
-Three installation levels are intentionally supported:
+The main source-development installation levels are:
 
 ```text
--e .                base slmcore only
--e .[test]          core development and testing
--e .[qt,test]       Qt development and full testing
+-e .                     base slmcore only
+-e .[test]               core development and testing
+-e .[qt,test]            reusable Qt development and full testing
+-e .[qt,demo,test]       standalone demo development
 ```
 
 The optional dependency groups are:
 
 - `test`: test tooling only.
-- `qt`: Qt bindings and the dependencies required by the reusable Qt interface and standalone host.
+- `qt`: Qt bindings and dependencies required by the reusable Qt interface.
+- `demo`: standalone-demo-only dependencies such as QDarkStyle. Use it together with `qt`.
+
+GPU acceleration is intentionally not represented by a package extra because the appropriate CuPy binary package depends on the CUDA major version installed on the system.
 
 `requirements-dev.txt` is only a convenience entry point for the normal non-Qt development environment:
 
@@ -214,7 +230,7 @@ The optional dependency groups are:
 
 ## Architecture
 
-`slmcore` is divided into six top-level architectural areas:
+`slmcore` is divided into six top-level architectural areas. See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the detailed ownership and calibration model:
 
 ```text
 src/slmcore/
@@ -261,12 +277,20 @@ The default layout is:
 
 ```text
 <root>/
+├── mappings.json
+├── observation_planes.json
 ├── configs/<serial>/
 ├── corrections/<serial>/
-└── calibrations/
+├── calibrations/<serial>/<section>/<mapping>.json
+├── fov_mapping_corrections/<serial>/<section>/<mapping>/<correction>.json
+├── geometry_orientation_calibrations/<serial>/<section>/<observation-plane>.json
+└── position_references/<observation-plane>/<reference>.json
 ```
 
-Persistent resources are namespaced using `SLMIdentity.serial_number`.
+Base mapping calibrations, FOV corrections, and geometry calibrations are scoped by
+physical `SLMIdentity.serial_number` where appropriate. Position references are
+intentionally workspace-wide and observation-plane scoped so different sections
+can align against the same detector-space reference.
 
 Embedding hosts normally provide only the workspace root. `slmcore` owns the standard layout below it.
 
@@ -274,16 +298,17 @@ Embedding hosts normally provide only the workspace root. `slmcore` owns the sta
 
 `setup/` defines the canonical description of an installed SLM.
 
-`SLMSetup` contains:
+`SLMDefinition` contains:
 
 - `SLMIdentity`: logical key, physical serial number, and display name.
-- `SLMGeometry`: width, height, and pixel size.
-- `SLMSectionsSetup`: section layout and layout policy.
-- optional `SLMHardwareSetup`: hardware binding for hosts that use native `slmcore` hardware definitions.
+- `SLMGeometry`: width, height, and SLM pixel size.
+- `SLMSectionsDefinition`: section layout and whether section geometry is customizable.
+
+Optional host-side hardware binding is represented separately by `SLMHardwareConfig`.
 
 Section geometries are derived by `slmcore` from the physical SLM geometry and declared section layout.
 
-`SLMStartupPreferences` stores session startup choices such as startup configuration, default calibration planes, and section display mode.
+`SLMStartupPreferences` stores session startup choices such as startup configuration, default mappings, mapping-scoped default FOV corrections, feedback-orientation fallbacks, focused-editing selections, and section display mode.
 
 Embedding hosts such as ImSwitch may store the same setup concepts inside their own setup format rather than using a standalone `slmcore` setup JSON file.
 
@@ -314,6 +339,56 @@ core runtime/model
 ```
 
 `SLMQtSession` adapts the toolkit-independent application session to Qt. Runtime/application state remains authoritative; Qt owns presentation, user interaction, dialogs, and interaction policy.
+
+## Mapping, observation and calibration model
+
+The current calibration model deliberately separates **pattern mapping** from
+**observation context**. They are independent axes.
+
+- A **mapping** is an SLM-to-sample metric calibration context, for example a
+  particular objective/relay configuration. Mapping selection affects metric
+  conversion and therefore CGH validity.
+- An **observation plane** describes where a measurement is interpreted. It may
+  suggest a detector and fallback sample-space pixel size, but changing the
+  observation plane does not change the active mapping or the CGH.
+- **Observation geometry** is the saved section × observation-plane orientation
+  relationship used when localized detector points must be assigned to logical
+  target identities.
+- An **FOV mapping correction** belongs to one section × mapping. Its calibration
+  observation plane is provenance only. Runtime selection/application is handled
+  independently from the fitting workflow.
+
+The application layer reflects those boundaries:
+
+```text
+SLMCalibrationService        active mapping + base mapping-calibration workflow
+MappingService               mapping catalog + persistent FOV corrections
+ObservationPlaneService      observation-plane catalog
+ObservationGeometryService   persisted section × observation-plane geometry
+GeometryCalibrationService   reusable geometry-calibration workflow
+FOVCalibrationService        dedicated FOV fitting workflow
+FOVMappingRuntimeService     selected/default/applied FOV correction at runtime
+SLMFeedbackService           measurement/localization/intensity/position/reference feedback
+```
+
+FOV application remains part of the CGH runtime because it changes resolved
+target positions. Ownership of the saved correction and its calibration workflow
+is outside the CGH session. The effective position path is:
+
+```text
+ideal resolved target positions
+        ↓
+optional mapping-owned FOV correction
+        ↓
+optional transient position-feedback correction
+        ↓
+final CGH target positions
+```
+
+Phase 1 intentionally keeps ordinary metric conversion effectively diagonal.
+The stored 2×2 representation remains available, but generalized off-diagonal
+parameter conversion and cross-observation-plane coordinate transforms are not
+part of the current contract.
 
 ## Configuration and frame reproducibility
 

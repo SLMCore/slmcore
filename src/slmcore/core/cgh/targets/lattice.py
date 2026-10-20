@@ -108,49 +108,70 @@ BASE_LATTICE_PARAMS = {
 
 @dataclass
 class LatticeLockState(StateModel):
-    """Persistent raster-lattice intent across separate parameter patches.
+    """Persistent lattice edit intent and optional hard lock.
 
-    ``kind`` is deliberately limited to the two dependent quantities whose
-    realized values may drift across repeated raster resolutions. ``reference``
-    stores the requested X/Y values, independently of the currently realized
-    canonical values shown by the parameter form.
+    ``kind``/``reference`` describe the explicit FOV or foci-count lock.
+    ``period_fov_reference`` is separate soft intent: while unlocked,
+    period-only edits reuse the last user-authored FOV reference instead of
+    feeding the rounded realized FOV back into the next edit.
     """
 
     kind: str | None = None
     reference: tuple[float, float] | None = None
+    period_fov_reference: tuple[float, float] | None = None
 
     KINDS = ("fov","n_foci")
 
     def validate(self) -> None:
         if self.kind is None:
             if self.reference is not None:
-                raise ValueError("Unlocked lattice state cannot keep a reference")
-            return
-        if self.kind not in self.KINDS:
-            raise ValueError(f"Unknown lattice lock kind {self.kind!r}")
-        if self.reference is None or len(self.reference) != 2:
-            raise ValueError("Locked lattice state requires an X/Y reference")
-        x,y = self.reference
-        if self.kind == "fov":
-            values = (float(x),float(y))
-            if any(value < 0 for value in values):
-                raise ValueError("Locked FOV references must be >= 0")
-            self.reference = values
+                raise ValueError("Unlocked lattice state cannot keep a hard reference")
         else:
-            values = (int(x),int(y))
-            if any(value <= 0 for value in values):
-                raise ValueError("Locked foci-count references must be > 0")
-            self.reference = values
+            if self.kind not in self.KINDS:
+                raise ValueError(f"Unknown lattice lock kind {self.kind!r}")
+            if self.reference is None or len(self.reference) != 2:
+                raise ValueError("Locked lattice state requires an X/Y reference")
+            x,y = self.reference
+            if self.kind == "fov":
+                values = (float(x),float(y))
+                if any(value < 0 for value in values):
+                    raise ValueError("Locked FOV references must be >= 0")
+                self.reference = values
+            else:
+                values = (int(x),int(y))
+                if any(value <= 0 for value in values):
+                    raise ValueError("Locked foci-count references must be > 0")
+                self.reference = values
+
+        if self.period_fov_reference is not None:
+            if len(self.period_fov_reference) != 2:
+                raise ValueError("Period FOV reference must contain X/Y values")
+            values = tuple(float(value) for value in self.period_fov_reference)
+            if any(value < 0 for value in values):
+                raise ValueError("Period FOV references must be >= 0")
+            self.period_fov_reference = values
 
     def set(self,kind: str | None,reference=None) -> None:
         self.kind = None if kind is None else str(kind)
         self.reference = None if reference is None else tuple(reference)
         self.validate()
 
+    def set_period_fov_reference(self,reference=None) -> None:
+        self.period_fov_reference = (
+            None if reference is None else tuple(reference)
+        )
+        self.validate()
+
     def to_dict(self) -> dict[str, Any]:
-        if self.kind is None:
-            return {"kind":None,"reference":None}
-        return {"kind":self.kind,"reference":list(self.reference)}
+        data = {
+            "kind":self.kind,
+            "reference":(
+                None if self.reference is None else list(self.reference)
+            ),
+        }
+        if self.period_fov_reference is not None:
+            data["period_fov_reference"] = list(self.period_fov_reference)
+        return data
 
     def load_dict(
         self,data: Mapping[str,Any],*,warnings: list[ConfigWarning] | None=None,
@@ -162,14 +183,16 @@ class LatticeLockState(StateModel):
             return
         try:
             self.set(data.get("kind"),data.get("reference"))
+            self.set_period_fov_reference(data.get("period_fov_reference"))
         except (TypeError,ValueError) as error:
             warnings.append(ConfigWarning(path,f"Invalid lattice lock; unlocked state kept ({error})"))
             self.set(None,None)
+            self.set_period_fov_reference(None)
 
 
 @dataclass(frozen=True)
 class LatticeLockRequest:
-    """Atomic request to replace one raster target's persistent lock."""
+    """Atomic request to replace one lattice target's persistent lock."""
 
     target_key: str
     kind: str | None
@@ -211,7 +234,7 @@ LATTICE_MODIFIER_PARAMS = {
         editor=EditorKind.DOUBLE_SPIN_BOX,
     ),
     "stagger":ParamSpec(
-        0.0,float,min_value=0.0,max_value=1.0,step=0.05,decimals=2,
+        0.0,float,min_value=-1.0,max_value=1.0,step=0.05,decimals=2,
         editor=EditorKind.DOUBLE_SPIN_BOX,
     ),
 }
@@ -230,10 +253,12 @@ def lattice_param_specs(modifiers: Sequence[str]=()) -> dict[str, ParamSpec]:
 def reconcile_lattice_params(
     params: Mapping[str,Any],
     changed_keys: Iterable[str],
+    *,
+    lock: LatticeLockState | None=None,
 ) -> dict[str, Any]:
-    """Reconcile the continuous lattice without persistent raster intent."""
+    """Reconcile a continuous lattice with optional persistent intent."""
     resolved,intent = reconcile_lattice_params_with_intent(
-        params,changed_keys,lock=None,
+        params,changed_keys,lock=lock,
     )
     del intent
     return resolved
@@ -351,11 +376,14 @@ def _reconcile_axis_params(
         if lock is not None and lock.kind == "n_foci":
             n_foci = int(lock_value)
         else:
-            target_fov = (
-                float(lock_value)
-                if lock is not None and lock.kind == "fov"
-                else current_fov
-            )
+            if lock is not None and lock.kind == "fov":
+                target_fov = float(lock_value)
+            elif lock is not None and lock.period_fov_reference is not None:
+                target_fov = float(
+                    lock.period_fov_reference[0 if axis == "x" else 1]
+                )
+            else:
+                target_fov = current_fov
             intent_fov_reference = target_fov
             n_foci = n_foci_from_fov(target_fov,period)
         fov = fov_from_n_foci(n_foci,period)
@@ -466,8 +494,8 @@ class LatticeDefinition:
             raise ValueError("Lattice periods must be > 0")
         if self.n_foci_x <= 0 or self.n_foci_y <= 0:
             raise ValueError("Lattice numbers of foci must be > 0")
-        if not 0.0 <= self.stagger <= 1.0:
-            raise ValueError("Lattice stagger must be in [0, 1]")
+        if not -1.0 <= self.stagger <= 1.0:
+            raise ValueError("Lattice stagger must be in [-1, 1]")
 
     @classmethod
     def from_params(cls,params: Mapping[str,Any]) -> "LatticeDefinition":

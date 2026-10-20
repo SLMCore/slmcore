@@ -137,7 +137,8 @@ def test_slm_sections_settings_dialog_opens_requested_section_and_uses_outer_scr
         assert dialog._content_scroll.widgetResizable()
 
         page = dialog.section_tabs.widget(1)
-        assert dialog._editors["sec_1"].parent() is page
+        assert page.isAncestorOf(dialog._editors["sec_1"])
+        assert page.isAncestorOf(dialog._focused_editors["sec_1"])
         direct_scrolls = [
             page.layout().itemAt(index).widget()
             for index in range(page.layout().count())
@@ -207,6 +208,45 @@ def test_sections_view_host_exposes_geometry_and_change_signals():
         assert host.section_geometries()["sec_1"] == (
             replacement_runtime.get_section_snapshot("sec_1").geometry
         )
+    finally:
+        host.deleteLater()
+        collection.deleteLater()
+
+
+def test_sections_view_host_uses_native_focused_view_text_toggle():
+    _app()
+    from qtpy import QtCore,QtWidgets
+    from slmcore.qt.sections.collection import SectionsCollectionView
+    from slmcore.qt.sections.view_host import SectionsViewHost
+
+    runtime = _runtime()
+    collection = SectionsCollectionView(
+        section_snapshots=runtime.get_section_snapshots(),
+    )
+    host = SectionsViewHost(collection,show_settings=False)
+    try:
+        button = host._tab_focused_button
+        assert button is not None
+        assert button.text() == "Focused View"
+        assert button.isCheckable()
+        assert button.parentWidget() is host.tab_bar()
+        assert host._tabs.cornerWidget(QtCore.Qt.TopRightCorner) is None
+        assert isinstance(button,QtWidgets.QPushButton)
+        assert button.styleSheet() == ""
+
+        host.resize(640,400)
+        host.show()
+        _app().processEvents()
+        host._position_tab_controls()
+        tab_bar = host.tab_bar()
+        assert tab_bar is not None
+        assert button.geometry().top() >= 2
+        assert tab_bar.height() - button.geometry().bottom() - 1 >= 2
+
+        host.set_focused_editing_available("sec_0",True)
+        host.set_focused_editing_state("sec_0",True)
+        assert button.isEnabled()
+        assert button.isChecked()
     finally:
         host.deleteLater()
         collection.deleteLater()

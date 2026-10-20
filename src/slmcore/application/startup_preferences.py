@@ -32,20 +32,20 @@ class StartupPreferencesState:
         value = str(filename or "").strip() or None
         self._commit(replace(self._value,startup_config=value))
 
-    def default_plane(self,section_key: str) -> str | None:
-        return self._value.default_planes.get(str(section_key))
+    def default_mapping(self,section_key: str) -> str | None:
+        return self._value.default_mappings.get(str(section_key))
 
-    def set_default_plane(
-        self,section_key: str,plane_name: str | None,
+    def set_default_mapping(
+        self,section_key: str,mapping_name: str | None,
     ) -> None:
         section = str(section_key)
-        plane = str(plane_name or "").strip() or None
-        planes = dict(self._value.default_planes)
-        if plane is None:
-            planes.pop(section,None)
+        mapping = str(mapping_name or "").strip() or None
+        mappings = dict(self._value.default_mappings)
+        if mapping is None:
+            mappings.pop(section,None)
         else:
-            planes[section] = plane
-        self._commit(replace(self._value,default_planes=planes))
+            mappings[section] = mapping
+        self._commit(replace(self._value,default_mappings=mappings))
 
     def section_display_mode(self) -> str:
         return self._value.section_display_mode
@@ -56,14 +56,31 @@ class StartupPreferencesState:
         self._commit(replace(self._value,section_display_mode=mode))
 
 
+    def focused_editing(self,section_key: str):
+        from ..setup import FocusedEditingPreferences
+        return self._value.focused_editing.get(
+            str(section_key),FocusedEditingPreferences(),
+        )
+
+    def set_focused_editing(self,section_key: str,value: Any) -> None:
+        from ..setup import FocusedEditingPreferences
+        section = str(section_key)
+        selection = FocusedEditingPreferences.from_value(value)
+        focused = dict(self._value.focused_editing)
+        if selection.configured:
+            focused[section] = selection
+        else:
+            focused.pop(section,None)
+        self._commit(replace(self._value,focused_editing=focused))
+
     def feedback_orientation_default(self,section_key: str) -> str:
         settings = self._value.feedback_orientations.get(str(section_key))
         return "identity" if settings is None else settings.default
 
-    def feedback_orientation_for_plane(
-        self,section_key: str,plane_name: str | None,
+    def feedback_orientation_for_observation_plane(
+        self,section_key: str,observation_plane_name: str | None,
     ) -> str | None:
-        plane = str(plane_name or "").strip()
+        plane = str(observation_plane_name or "").strip()
         if not plane:
             return None
         settings = self._value.feedback_orientations.get(str(section_key))
@@ -72,9 +89,9 @@ class StartupPreferencesState:
         return settings.planes.get(plane)
 
     def feedback_orientation(
-        self,section_key: str,plane_name: str | None=None,
+        self,section_key: str,observation_plane_name: str | None=None,
     ) -> str:
-        override = self.feedback_orientation_for_plane(section_key,plane_name)
+        override = self.feedback_orientation_for_observation_plane(section_key,observation_plane_name)
         if override is not None:
             return override
         return self.feedback_orientation_default(section_key)
@@ -93,15 +110,15 @@ class StartupPreferencesState:
         )
         self._commit(replace(self._value,feedback_orientations=orientations))
 
-    def set_feedback_orientation_for_plane(
-        self,section_key: str,plane_name: str,value: Any,
+    def set_feedback_orientation_for_observation_plane(
+        self,section_key: str,observation_plane_name: str,value: Any,
     ) -> None:
         from ..core.cgh.feedback import FeedbackOrientation
         from ..setup import FeedbackOrientationPreferences
         section = str(section_key)
-        plane = str(plane_name or "").strip()
+        plane = str(observation_plane_name or "").strip()
         if not plane:
-            raise ValueError("plane_name must not be empty")
+            raise ValueError("observation_plane_name must not be empty")
         orientation = FeedbackOrientation.normalize(value).value
         orientations = dict(self._value.feedback_orientations)
         previous = orientations.get(section,FeedbackOrientationPreferences())
@@ -112,12 +129,12 @@ class StartupPreferencesState:
         )
         self._commit(replace(self._value,feedback_orientations=orientations))
 
-    def clear_feedback_orientation_for_plane(
-        self,section_key: str,plane_name: str,
+    def clear_feedback_orientation_for_observation_plane(
+        self,section_key: str,observation_plane_name: str,
     ) -> None:
         from ..setup import FeedbackOrientationPreferences
         section = str(section_key)
-        plane = str(plane_name or "").strip()
+        plane = str(observation_plane_name or "").strip()
         if not plane:
             return
         orientations = dict(self._value.feedback_orientations)
@@ -131,42 +148,62 @@ class StartupPreferencesState:
         )
         self._commit(replace(self._value,feedback_orientations=orientations))
 
-    def default_fov_position_calibration(
-        self,section_key: str,plane_name: str | None,
+    def default_fov_correction(
+        self,section_key: str,mapping_name: str | None,
     ) -> str | None:
-        plane = str(plane_name or "").strip()
-        if not plane:
+        mapping = str(mapping_name or "").strip()
+        if not mapping:
             return None
-        settings = self._value.fov_position_calibrations.get(str(section_key))
+        settings = self._value.fov_mapping_corrections.get(str(section_key))
         if settings is None:
             return None
-        return settings.planes.get(plane)
+        return settings.mappings.get(mapping)
 
-    def set_default_fov_position_calibration(
-        self,section_key: str,plane_name: str,name: str | None,
+    def set_default_fov_correction(
+        self,section_key: str,mapping_name: str,name: str | None,
     ) -> None:
-        from ..setup import FOVPositionCalibrationPreferences
+        from ..setup import FOVMappingCorrectionPreferences
         section = str(section_key)
-        plane = str(plane_name or "").strip()
-        if not plane:
-            raise ValueError("plane_name must not be empty")
-        calibration_name = str(name or "").strip() or None
-        values = dict(self._value.fov_position_calibrations)
-        previous = values.get(section,FOVPositionCalibrationPreferences())
-        planes = dict(previous.planes)
-        if calibration_name is None:
-            planes.pop(plane,None)
+        mapping = str(mapping_name or "").strip()
+        if not mapping:
+            raise ValueError("mapping_name must not be empty")
+        correction_name = str(name or "").strip() or None
+        values = dict(self._value.fov_mapping_corrections)
+        previous = values.get(section,FOVMappingCorrectionPreferences())
+        mappings = dict(previous.mappings)
+        if correction_name is None:
+            mappings.pop(mapping,None)
         else:
-            planes[plane] = calibration_name
-        if planes:
-            values[section] = FOVPositionCalibrationPreferences(planes=planes)
+            mappings[mapping] = correction_name
+        if mappings:
+            values[section] = FOVMappingCorrectionPreferences(mappings=mappings)
         else:
             values.pop(section,None)
-        self._commit(replace(self._value,fov_position_calibrations=values))
+        self._commit(replace(self._value,fov_mapping_corrections=values))
 
-    # Compatibility helper for the first pre-release section-only behavior.
-    def set_feedback_orientation(self,section_key: str,value: Any) -> None:
-        self.set_feedback_orientation_default(section_key,value)
+    def remove_mapping(self,mapping_name: str) -> None:
+        """Remove all startup/default state owned by one mapping profile."""
+        from ..setup import FOVMappingCorrectionPreferences
+        mapping = str(mapping_name or "").strip()
+        if not mapping:
+            raise ValueError("mapping_name must not be empty")
+
+        default_mappings = {
+            section:value for section,value in self._value.default_mappings.items()
+            if str(value or "").strip() != mapping
+        }
+        fov_values = {}
+        for section,settings in self._value.fov_mapping_corrections.items():
+            mappings = dict(settings.mappings)
+            mappings.pop(mapping,None)
+            if mappings:
+                fov_values[section] = FOVMappingCorrectionPreferences(mappings=mappings)
+
+        self._commit(replace(
+            self._value,
+            default_mappings=default_mappings,
+            fov_mapping_corrections=fov_values,
+        ))
 
     def _commit(self,new_value: SLMStartupPreferences) -> None:
         if new_value == self._value:

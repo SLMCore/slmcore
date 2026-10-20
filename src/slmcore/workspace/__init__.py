@@ -7,9 +7,14 @@ from .config_store import (
     SLMConfigStore,
 )
 from .correction_store import SLMCorrectionStore
-from .position_reference_store import SLMPositionReferenceStore
-from .fov_position_calibration_store import SLMFOVPositionCalibrationStore
+from .fov_mapping_correction_store import FOVMappingCorrectionStore
 from .geometry_orientation_calibration_store import SLMGeometryOrientationCalibrationStore
+from .mapping_store import MappingDefinition,MappingStore
+from .observation_plane_store import ObservationPlaneDefinition,ObservationPlaneStore
+from .observation_registration_store import ObservationRegistrationStore
+from .position_reference_store import (
+    PositionReferenceLifetime,PositionReferenceRecord,PositionReferenceStore,
+)
 from .workspace import SLMWorkspace
 
 __all__ = [
@@ -20,8 +25,15 @@ __all__ = [
     "SLMConfigMetadata",
     "SLMConfigStore",
     "SLMCorrectionStore",
-    "SLMPositionReferenceStore",
-    "SLMFOVPositionCalibrationStore",
+    "FOVMappingCorrectionStore",
     "SLMGeometryOrientationCalibrationStore",
+    "MappingDefinition",
+    "MappingStore",
+    "ObservationPlaneDefinition",
+    "ObservationPlaneStore",
+    "ObservationRegistrationStore",
+    "PositionReferenceLifetime",
+    "PositionReferenceRecord",
+    "PositionReferenceStore",
     "SLMWorkspace",
 ]
