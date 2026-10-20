@@ -1,5 +1,11 @@
 """Public facade for the reusable SLM control package."""
+from importlib.metadata import PackageNotFoundError, version
 
+try:
+    __version__ = version("slmcore")
+except PackageNotFoundError:
+    __version__ = "unknown"
+    
 # Registry primitives are intentionally imported first. Populate the default
 # registry explicitly before exposing runtime/application objects that consume
 # it.
