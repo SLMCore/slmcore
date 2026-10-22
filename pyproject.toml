@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "slmcore-microscopy"
-version = "0.1.0"
+version = "0.1.1"
 description = "Reusable SLM control, pattern generation and CGH framework"
 readme = "README.md"
 license = "GPL-3.0-only"
