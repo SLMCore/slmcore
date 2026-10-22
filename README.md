@@ -15,13 +15,13 @@ Host applications should use the public `slmcore` interfaces rather than maintai
 Install the host-independent core package with:
 
 ```bash
-python -m pip install slmcore
+python -m pip install slmcore-microscopy
 ```
 
 Install the reusable Qt interface when `slmcore` is used as its own Qt application or from a host that does not already provide the required Qt stack:
 
 ```bash
-python -m pip install "slmcore[qt]"
+python -m pip install "slmcore-microscopy[qt]"
 ```
 
 Importing `slmcore` itself does not import Qt. Qt functionality is accessed explicitly through `slmcore.qt`.
