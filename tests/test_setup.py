@@ -118,3 +118,82 @@ def test_canonical_setup_file_load_and_preference_update(tmp_path):
     assert data["hardware"] == hardware.to_dict()
     assert data["startup_preferences"] == changed.to_dict()
     assert data["host_note"] == "preserved"
+
+def test_definition_authoring_schema_describes_canonical_fields():
+    from slmcore import slm_definition_schema
+
+    schema = slm_definition_schema()
+    assert schema["$schema"].endswith("2020-12/schema")
+    assert schema["properties"]["geometry"]["properties"]["width"]["minimum"] == 1
+    layout = schema["properties"]["sections"]["properties"]["layout"]
+    assert layout["properties"]["axis"]["enum"] == ["x","y"]
+    assert layout["properties"]["mode"]["enum"] == ["even","manual"]
+    assert "key" in schema["properties"]["identity"]["required"]
+    serialized = _definition().to_dict()
+    assert set(schema["properties"]) == set(serialized)
+    assert set(schema["properties"]["identity"]["properties"]) == set(serialized["identity"])
+    assert set(schema["properties"]["geometry"]["properties"]) == set(serialized["geometry"])
+    assert set(schema["properties"]["sections"]["properties"]) == set(serialized["sections"])
+    assert set(layout["properties"]) == set(serialized["sections"]["layout"])
+
+
+def test_definition_authoring_schema_supports_host_managed_key():
+    from slmcore import slm_definition_schema
+
+    schema = slm_definition_schema(host_managed_key=True)
+    identity = schema["properties"]["identity"]
+    assert "key" not in identity["properties"]
+    assert "key" not in identity["required"]
+    assert "serial_number" in identity["required"]
+
+
+def test_authoring_schemas_are_isolated_mutable_copies():
+    from slmcore import slm_definition_schema,slm_startup_preferences_schema
+
+    definition = slm_definition_schema()
+    definition["properties"]["geometry"]["title"] = "changed"
+    assert slm_definition_schema()["properties"]["geometry"]["title"] == "Geometry"
+
+    preferences = slm_startup_preferences_schema()
+    preferences["properties"]["startup_config"]["title"] = "changed"
+    assert (
+        slm_startup_preferences_schema()["properties"]["startup_config"]["title"]
+        == "Startup config"
+    )
+
+
+def test_startup_preferences_authoring_schema_covers_current_preferences():
+    from slmcore import slm_startup_preferences_schema
+
+    schema = slm_startup_preferences_schema()
+    assert set(schema["properties"]) == set(SLMStartupPreferences().to_dict())
+    assert schema["properties"]["section_display_mode"]["enum"] == [
+        "tabs","horizontal",
+    ]
+    orientation = (
+        schema["properties"]["feedback_orientations"]
+        ["additionalProperties"]["properties"]["default"]
+    )
+    assert "identity" in orientation["enum"]
+    assert "transpose" in orientation["enum"]
+
+
+def test_authoring_validation_helpers_use_canonical_models():
+    from slmcore import validate_slm_definition,validate_slm_startup_preferences
+
+    data = _definition().to_dict()
+    data["identity"].pop("key")
+    validated = validate_slm_definition(data,key="host_key")
+    assert validated.identity.key == "host_key"
+
+    with pytest.raises(ValueError,match="expected 10"):
+        invalid = _definition().to_dict()
+        invalid["sections"]["layout"].update(
+            {"mode":"manual","sizes":[4,4]},
+        )
+        validate_slm_definition(invalid)
+
+    preferences = validate_slm_startup_preferences({
+        "default_mappings":{"sec_0":"Sample"},
+    })
+    assert preferences.default_mappings["sec_0"] == "Sample"

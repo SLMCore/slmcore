@@ -1,3 +1,7 @@
+from .authoring import (
+    slm_definition_schema,slm_startup_preferences_schema,
+    validate_slm_definition,validate_slm_startup_preferences,
+)
 from .io import (
     SLM_SETUP_FILE_SCHEMA_VERSION,
     load_slm_setup_file,
@@ -11,6 +15,10 @@ from .preferences import (
 
 __all__ = [
     "SLM_SETUP_FILE_SCHEMA_VERSION",
+    "slm_definition_schema",
+    "slm_startup_preferences_schema",
+    "validate_slm_definition",
+    "validate_slm_startup_preferences",
     "SLMDefinition",
     "SLMHardwareConfig",
     "SLMSectionsDefinition",

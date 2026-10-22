@@ -117,6 +117,10 @@ from .core.measurement import (
 from .core.transform2d import FittedTransform2D,fit_transform2d
 from .setup import (
     SLM_SETUP_FILE_SCHEMA_VERSION,
+    slm_definition_schema,
+    slm_startup_preferences_schema,
+    validate_slm_definition,
+    validate_slm_startup_preferences,
     SLMDefinition,
     SLMHardwareConfig,
     SLMSectionsDefinition,
@@ -210,6 +214,10 @@ __all__ = [
     "SectionUpdate",
     "SLM_CONFIG_SCHEMA_VERSION",
     "SLM_SETUP_FILE_SCHEMA_VERSION",
+    "slm_definition_schema",
+    "slm_startup_preferences_schema",
+    "validate_slm_definition",
+    "validate_slm_startup_preferences",
     "SLMArtifacts",
     "SLMCalibrationService",
     "SLMCalibrationStore",
